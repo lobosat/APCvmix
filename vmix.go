@@ -58,7 +58,7 @@ func (c *vmixClient) SendMessage(message string) error {
 	return err
 }
 
-func (c *vmixClient) GetMessage(vmixMessage chan string, wg *sync.WaitGroup)  {
+func (c *vmixClient) GetMessage(vmixMessage chan string, wg *sync.WaitGroup) {
 
 	// Subscribe to the activator feed in the vMix API
 	err := c.SendMessage("SUBSCRIBE ACTS")
@@ -96,11 +96,10 @@ func ProcessMidi(midiMessage chan []byte) {
 		case 128:
 			fmt.Println("Button Up:", msg[1])
 		case 176:
-			fmt.Println("Control change. Fader:", msg[1], "Value:",msg[2])
+			fmt.Println("Control change. Fader:", msg[1], "Value:", msg[2])
 		}
 	}
 }
-
 
 func ListenMidi(drv midi.Driver, midiMessage chan []byte, wg *sync.WaitGroup) {
 	//Listen to midi port, push any messages to the midiMessage channel
@@ -112,38 +111,37 @@ func ListenMidi(drv midi.Driver, midiMessage chan []byte, wg *sync.WaitGroup) {
 		fmt.Println("Error in ListenMidi", err)
 	}
 	for {
-			_ = in.SetListener(func(data []byte, deltaMicroseconds int64) {
-				midiMessage <- data
-			})
+		_ = in.SetListener(func(data []byte, deltaMicroseconds int64) {
+			midiMessage <- data
+		})
 	}
 }
 
 func main() {
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	vmixClient := NewClient()
-	err := vmixClient.Connect("192.168.1.173:8099")
+	//vmixClient := NewClient()
+	//err := vmixClient.Connect("192.168.1.173:8099")
+	//vmixMessage := make(chan string)
+	//defer close(vmixMessage)
+	//
 
+	//
+	//go vmixClient.GetMessage(vmixMessage, &wg)
+	//go ProcessMessage(vmixMessage)
 
-	vmixMessage := make(chan string)
 	midiMessage := make(chan []byte, 100)
-	defer close(vmixMessage)
 	defer close(midiMessage)
 
 	drv, err := rtmididrv.New()
-
 	if err != nil {
 		panic(err)
 	}
 	defer drv.Close()
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go vmixClient.GetMessage(vmixMessage, &wg)
-	go ProcessMessage(vmixMessage)
 	go ListenMidi(drv, midiMessage, &wg)
 	go ProcessMidi(midiMessage)
-
 
 	wg.Wait()
 
