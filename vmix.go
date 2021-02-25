@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"fmt"
 	"gitlab.com/gomidi/midi"
+	"gitlab.com/gomidi/midi/reader"
+	"gitlab.com/gomidi/midi/writer"
 	"gitlab.com/gomidi/rtmididrv"
 	"net"
 	"strings"
@@ -87,33 +89,124 @@ func ProcessMessage(vmixMessage chan string) {
 	}
 }
 
-func ProcessMidi(midiMessage chan []byte) {
+func ProcessMidi(midiMessageChan chan []byte) {
+	// message is a byte [type button velocity]
+	// type 144 is a button push
+	// type 176 is a control change
 	for {
-		msg := <-midiMessage
+		msg := <-midiMessageChan
 		switch msg[0] {
 		case 144:
-			fmt.Println("Button Down:", msg[1])
-		case 128:
-			fmt.Println("Button Up:", msg[1])
+			if msg[2] == 0 {
+				fmt.Println("Button Up:", msg[1])
+			}
+			if msg[2] == 127 {
+				fmt.Println("Button Down:", msg[1])
+			}
 		case 176:
 			fmt.Println("Control change. Fader:", msg[1], "Value:", msg[2])
 		}
 	}
 }
 
-func ListenMidi(drv midi.Driver, midiMessage chan []byte, wg *sync.WaitGroup) {
+func ListenMidi(inPort midi.In, midiMessageChan chan []byte, wg *sync.WaitGroup) {
 	//Listen to midi port, push any messages to the midiMessage channel
-	defer drv.Close()
-	in, err := midi.OpenIn(drv, 1, "")
 
-	if err != nil {
+	rd := reader.New(
+		reader.NoLogger(),
+
+		// Fetch every message
+		reader.Each(func(pos *reader.Position, msg midi.Message) {
+			midiMessageChan <- msg.Raw()
+		}),
+	)
+
+	err := rd.ListenTo(inPort)
+	if err == nil {
+		wg.Wait()
+	} else {
+		fmt.Println(err)
 		wg.Done()
-		fmt.Println("Error in ListenMidi", err)
 	}
-	for {
-		_ = in.SetListener(func(data []byte, deltaMicroseconds int64) {
-			midiMessage <- data
-		})
+}
+
+func setAPCLED(outPort midi.Out, button uint8, color string) {
+	values := map[string]uint8{
+		"green":       1,
+		"greenBlink":  2,
+		"red":         3,
+		"redBlink":    4,
+		"yellow":      5,
+		"yellowBlink": 6,
+		"on":          1, //for round buttons - they can only be red(on), or red blinking (blink)
+		"blink":       2,
+	}
+	wr := writer.New(outPort)
+	wr.ConsolidateNotes(false)
+	if color == "off" {
+		_ = writer.NoteOff(wr, button)
+	} else {
+		_ = writer.NoteOn(wr, button, values[color])
+	}
+
+}
+
+func getMIDIPorts() (midi.In, midi.Out) {
+	//Iterate through all midi ports on the driver and identify the ones
+	//belonging to an APC Mini.  Return the input port and output port.
+
+	foundAPCIn := false
+	foundAPCOut := false
+
+	drv, err := rtmididrv.New()
+	if err != nil {
+		panic(err)
+	}
+
+	inPorts, _ := drv.Ins()
+	outPorts, _ := drv.Outs()
+
+	inPort, err := midi.OpenIn(drv, 0, "")
+	if err != nil {
+		panic("No MIDI Input Ports found")
+		return nil, nil
+	}
+
+	outPort, err := midi.OpenOut(drv, 0, "")
+	if err != nil {
+		panic("No MIDI Output Ports found")
+		return nil, nil
+	}
+
+	for i, port := range inPorts {
+		if strings.Contains(port.String(), "APC MINI") {
+			inPort, err = midi.OpenIn(drv, i, "")
+			if err != nil {
+				panic("Unable to open MIDI port")
+				return nil, nil
+			} else {
+				foundAPCIn = true
+			}
+		}
+	}
+
+	for i, port := range outPorts {
+		if strings.Contains(port.String(), "APC MINI") {
+			outPort, err = midi.OpenOut(drv, i, "")
+			if err != nil {
+				panic("Unable to open MIDI port")
+				return nil, nil
+			} else {
+				foundAPCOut = true
+			}
+		}
+	}
+
+	if foundAPCIn && foundAPCOut {
+		return inPort, outPort
+	} else {
+		panic("No APC Mini found. Aborting")
+		return nil, nil
 	}
 }
 
@@ -121,27 +214,27 @@ func main() {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	//vmixClient := NewClient()
-	//err := vmixClient.Connect("192.168.1.173:8099")
-	//vmixMessage := make(chan string)
-	//defer close(vmixMessage)
-	//
-
-	//
-	//go vmixClient.GetMessage(vmixMessage, &wg)
-	//go ProcessMessage(vmixMessage)
-
-	midiMessage := make(chan []byte, 100)
-	defer close(midiMessage)
-
-	drv, err := rtmididrv.New()
+	vmixClient := NewClient()
+	err := vmixClient.Connect("192.168.1.173:8099")
 	if err != nil {
+		fmt.Println("Error connecting to vmix API:")
 		panic(err)
 	}
-	defer drv.Close()
+	vmixMessageChan := make(chan string)
+	defer close(vmixMessageChan)
 
-	go ListenMidi(drv, midiMessage, &wg)
-	go ProcessMidi(midiMessage)
+	go vmixClient.GetMessage(vmixMessageChan, &wg)
+	go ProcessMessage(vmixMessageChan)
+
+	midiMessageChan := make(chan []byte, 100)
+	defer close(midiMessageChan)
+
+	inPort, outPort := getMIDIPorts()
+	fmt.Println(outPort)
+	setAPCLED(outPort, 71, "off")
+
+	go ListenMidi(inPort, midiMessageChan, &wg)
+	go ProcessMidi(midiMessageChan)
 
 	wg.Wait()
 
