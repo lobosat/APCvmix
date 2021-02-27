@@ -20,7 +20,6 @@ type vmixClientType struct {
 	sync.Mutex
 	connected bool
 }
-
 type vmixFunc struct {
 	action string
 	input  string
@@ -35,7 +34,6 @@ var vmixStateSingle = map[string]string{
 	"Overlay3":     "",
 	"Overlay4":     "",
 }
-
 var vmixStateMultiple = map[string]map[string]bool{
 	"InputPlaying":   {},
 	"InputBusAAudio": {},
@@ -56,9 +54,14 @@ func init() {
 		panic(err)
 	}
 
+	//Get the APC Mini MIDI In and Out ports
 	midiIn, midiOut = getMIDIPorts()
 }
 
+// vmixAPIConnect connects to the vMix API. apiAddress is a string
+// of the format ipaddress:port.  By default the vMix API is on port 8099.
+// If vMix is not up, this function will continue trying to connect, and will
+// block until a connection is achieved.
 func vmixAPIConnect(apiAddress string) error {
 	vmixClient.connected = false
 	for vmixClient.connected == false {
@@ -83,6 +86,8 @@ func vmixAPIConnect(apiAddress string) error {
 	return nil
 }
 
+// SendMessage sends a message to the vMix API. It adds the
+// /r/n terminator the API expects
 func SendMessage(message string) error {
 	vmixClient.Lock()
 	pub := fmt.Sprintf("%v\r\n", message)
@@ -95,11 +100,11 @@ func SendMessage(message string) error {
 	return err
 }
 
-// GetMessage connects to the vMix API and issues a subscription to activators.
+// getMessage connects to the vMix API and issues a subscription to activators.
 // It then remains listening for any messages from the API server.  Any messages
 // received are sent to the vmixMessageChan channel for consumption.  This is a blocking
-// function.
-func GetMessage() {
+// function.  The vmixClient must already be connected to the API and available as a global.
+func getMessage() {
 
 	// Subscribe to the activator feed in the vMix API
 	err := SendMessage("SUBSCRIBE ACTS")
@@ -121,7 +126,10 @@ func GetMessage() {
 	}
 }
 
-func ProcessMessage() {
+// ProcessVmixMessage listens to the vMix API channel for any messages from the API.
+// It uses these messages to update the vMix State maps which are used for the
+// conditional actions. This is a blocking function.
+func ProcessVmixMessage() {
 	for {
 		messageSlice := strings.Fields(<-vmixMessageChan)
 		// ex:  [ACTS OK InputPlaying 9 1]
@@ -152,7 +160,10 @@ func ProcessMessage() {
 	}
 }
 
-func execVmixFunc(fn *vmixFunc) {
+// ExecVmixFunc executes a vMix function/action by writing to the API TCP port.  It takes
+// a vmixFunc type which includes the action (mandatory), and input and value if appropriate for
+// the action.
+func ExecVmixFunc(fn *vmixFunc) {
 	var message string
 
 	switch fn.action {
@@ -187,8 +198,8 @@ func ProcessMidi() {
 	}
 }
 
-func ListenMidi() {
-	//Listen to midi port, push any messages to the midiMessage channel
+func listenMidi() {
+
 	rd := reader.New(
 		reader.NoLogger(),
 
@@ -207,6 +218,10 @@ func ListenMidi() {
 	}
 }
 
+// setAPCLED sets the color of APC Mini buttons.  Rectangular buttons
+// can be set to green, yellow, or red solid or binking. The round buttons
+// can only be on (solid red) or blink (blinking red).  The square button over
+// the rightmost fader does not appear to have any LEDs
 func setAPCLED(button uint8, color string) {
 	values := map[string]uint8{
 		"green":       1,
@@ -215,8 +230,8 @@ func setAPCLED(button uint8, color string) {
 		"redBlink":    4,
 		"yellow":      5,
 		"yellowBlink": 6,
-		"on":          1, //for round buttons - they can only be red(on), or red blinking (blink)
-		"blink":       2,
+		"on":          1, // for round buttons - they can only be red(on)
+		"blink":       2, // or red blinking (blink)
 	}
 	wr := writer.New(midiOut)
 	wr.ConsolidateNotes(false)
@@ -288,15 +303,20 @@ func getMIDIPorts() (midi.In, midi.Out) {
 func main() {
 
 	wg.Add(2)
+	defer vmixClient.conn.Close()
+	defer midiIn.Close()
+	defer midiOut.Close()
 	defer close(vmixMessageChan)
 	defer close(midiMessageChan)
 
-	go GetMessage()
-	go ProcessMessage()
+	// Processes to listen to the vMix API and act on the messages
+	go getMessage()
+	go ProcessVmixMessage()
 
 	setAPCLED(7, "green")
 
-	go ListenMidi()
+	// Listen to the APC Mini and act on button or control changes
+	go listenMidi()
 	go ProcessMidi()
 
 	wg.Wait()
