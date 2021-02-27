@@ -3,6 +3,9 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"net/url"
+
+	//"github.com/360EntSecGroup-Skylar/excelize/v2"
 	"gitlab.com/gomidi/midi"
 	"gitlab.com/gomidi/midi/reader"
 	"gitlab.com/gomidi/midi/writer"
@@ -26,6 +29,13 @@ type vmixFunc struct {
 	value  string
 }
 
+type overlayResponse struct {
+	button   string
+	input    string
+	tbName   string
+	response string
+}
+
 var vmixStateSingle = map[string]string{
 	"Input":        "",
 	"InputPreview": "",
@@ -45,6 +55,7 @@ var vmixMessageChan = make(chan string)
 var midiMessageChan = make(chan []byte, 100)
 var midiIn midi.In
 var midiOut midi.Out
+var overlayResponses = make(map[int]*overlayResponse)
 
 func init() {
 	//Connect to the vmix API
@@ -56,6 +67,14 @@ func init() {
 
 	//Get the APC Mini MIDI In and Out ports
 	midiIn, midiOut = getMIDIPorts()
+
+	or := new(overlayResponse)
+	or.button = "7"
+	or.input = "1"
+	or.response = "The Rain in Spain \r\n Stays Mainly in the Plain"
+	or.tbName = "Response.Text"
+
+	overlayResponses[7] = or
 }
 
 // vmixAPIConnect connects to the vMix API. apiAddress is a string
@@ -119,6 +138,7 @@ func getMessage() {
 
 		if err == nil {
 			vmixMessageChan <- line
+			fmt.Println(line)
 		} else {
 			wg.Done()
 			fmt.Println("Error in GetMessage.ReadString: ", err)
@@ -184,16 +204,34 @@ func ProcessMidi() {
 	// type 176 is a control change
 	for {
 		msg := <-midiMessageChan
+		button := int(msg[1])
+		var message string
+
 		switch msg[0] {
 		case 144:
-			if msg[2] == 0 {
-				fmt.Println("Button Up:", msg[1])
-			}
 			if msg[2] == 127 {
+				// button pressed
 				fmt.Println("Button Down:", msg[1])
+				//Check overlayResponses to see if we have a match
+				if _, ok := overlayResponses[button]; ok {
+					ExecTextOverlay(button)
+				}
 			}
+			if msg[2] == 0 {
+				//button released
+				fmt.Println("Button Up:", msg[1])
+				//Check overlayResponses to see if we have a match. If so remove the overlab
+				if _, ok := overlayResponses[button]; ok {
+					message = "FUNCTION OverlayInput1Out"
+				}
+			}
+
 		case 176:
+			// Fader moved
 			fmt.Println("Control change. Fader:", msg[1], "Value:", msg[2])
+		}
+		if message != "" {
+			_ = SendMessage(message)
 		}
 	}
 }
@@ -297,6 +335,22 @@ func getMIDIPorts() (midi.In, midi.Out) {
 	} else {
 		panic("No APC Mini found. Aborting")
 		return nil, nil
+	}
+}
+
+func ExecTextOverlay(button int) {
+	var message string
+
+	if item, ok := overlayResponses[button]; ok {
+		//set the text
+		message = "FUNCTION SetText Input=" + item.input + "&SelectedName=" + url.QueryEscape(item.tbName) +
+			"&Value=" + url.QueryEscape(item.response)
+		_ = SendMessage(message)
+		//pause for 100 milliseconds to allow text to update
+		d, _ := time.ParseDuration("100ms")
+		time.Sleep(d)
+		message = "FUNCTION OverlayInput1In Input=" + item.input
+		_ = SendMessage(message)
 	}
 }
 
