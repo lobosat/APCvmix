@@ -3,14 +3,14 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"net/url"
-
-	//"github.com/360EntSecGroup-Skylar/excelize/v2"
+	"github.com/360EntSecGroup-Skylar/excelize/v2"
 	"gitlab.com/gomidi/midi"
 	"gitlab.com/gomidi/midi/reader"
 	"gitlab.com/gomidi/midi/writer"
 	"gitlab.com/gomidi/rtmididrv"
 	"net"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,11 +29,26 @@ type vmixFunc struct {
 	value  string
 }
 
-type overlayResponse struct {
-	button   string
-	input    string
+type vmixRespConfig struct {
+	button   int
+	input    int
 	tbName   string
 	response string
+}
+
+type vmixSCConfig struct {
+	button          int
+	actionsPressed  []string
+	actionsReleased []string
+}
+
+type vmixPrayerConfig struct {
+	button  int
+	input   int
+	tb1Name string
+	text1   string
+	tb2Name string
+	text2   string
 }
 
 var vmixStateSingle = map[string]string{
@@ -55,7 +70,9 @@ var vmixMessageChan = make(chan string)
 var midiMessageChan = make(chan []byte, 100)
 var midiIn midi.In
 var midiOut midi.Out
-var overlayResponses = make(map[int]*overlayResponse)
+var scConfig = make(map[int]*vmixSCConfig)
+var respConfig = make(map[int]*vmixRespConfig)
+var prayerConfig = make(map[int]*vmixPrayerConfig)
 
 func init() {
 	//Connect to the vmix API
@@ -67,14 +84,70 @@ func init() {
 
 	//Get the APC Mini MIDI In and Out ports
 	midiIn, midiOut = getMIDIPorts()
+}
 
-	or := new(overlayResponse)
-	or.button = "7"
-	or.input = "1"
-	or.response = "The Rain in Spain \r\n Stays Mainly in the Plain"
-	or.tbName = "Response.Text"
+// readConfig is a blocking function that reads the "responses.xlsx" spreadsheet for configuration
+// of shortcuts, overlay text, etc.  This function is intended to run inside a go function.
+func readConfig() {
+	for {
+		wb, err := excelize.OpenFile("responses.xlsx")
+		if err != nil {
+			fmt.Println("Error opening workbook:", err)
+			return
+		}
 
-	overlayResponses[7] = or
+		//Shortcuts
+		scRows, _ := wb.GetRows("Shortcuts")
+		for idx, row := range scRows {
+			if idx != 0 && row != nil {
+				btn, _ := strconv.Atoi(row[0])
+				cfg := new(vmixSCConfig)
+				cfg.button = btn
+				cfg.actionsPressed = strings.Split(row[1], "/n")
+				if len(row) == 3 {
+					cfg.actionsReleased = strings.Split(row[2], ";")
+				}
+				scConfig[btn] = cfg
+			}
+		}
+
+		// Responses
+		respRows, _ := wb.GetRows("Responses")
+		for i, row := range respRows {
+			if i != 0 && row != nil {
+				btn, _ := strconv.Atoi(row[0])
+				input, _ := strconv.Atoi(row[1])
+				or := new(vmixRespConfig)
+				or.button = btn
+				or.input = input
+				or.tbName = row[2]
+				or.response = row[3]
+				respConfig[btn] = or
+			}
+		}
+		// Prayers
+		prayerCols, _ := wb.GetCols("Prayers")
+		for i, col := range prayerCols {
+			if i != 0 && col != nil {
+				pr := new(vmixPrayerConfig)
+				input, _ := strconv.Atoi(col[1])
+				button, _ := strconv.Atoi(col[2])
+				pr.input = input
+				pr.button = button
+				pr.tb1Name = col[3]
+				pr.text1 = col[4]
+				if len(col) > 5 && col[5] != "----" {
+					pr.tb2Name = col[5]
+					pr.text2 = col[6]
+				}
+
+				prayerConfig[button] = pr
+			}
+		}
+
+		duration, _ := time.ParseDuration("5s")
+		time.Sleep(duration)
+	}
 }
 
 // vmixAPIConnect connects to the vMix API. apiAddress is a string
@@ -92,7 +165,8 @@ func vmixAPIConnect(apiAddress string) error {
 			vmixClient.w = bufio.NewWriter(conn)
 			vmixClient.r = bufio.NewReader(conn)
 			vmixClient.connected = true
-		} else if strings.Contains(err.Error(), "connection timed out") {
+		} else if strings.Contains(err.Error(), "connection timed out") ||
+			strings.Contains(err.Error(), "connection refused") {
 			fmt.Println("vmix api is inaccessible.  Probably because vMix is not running")
 			fmt.Println("Waiting 5 seconds and trying again")
 			vmixClient.connected = false
@@ -166,6 +240,11 @@ func ProcessVmixMessage() {
 				if state == "1" {
 					vmixStateSingle[parameter] = input
 				}
+				if state == "0" {
+					if vmixStateSingle[parameter] == input {
+						vmixStateSingle[parameter] = ""
+					}
+				}
 			case "InputPlaying", "InputBusAAudio", "InputBusBAudio":
 				if state == "0" {
 					vmixStateMultiple[parameter][input] = false
@@ -175,8 +254,6 @@ func ProcessVmixMessage() {
 				}
 			}
 		}
-		fmt.Println(vmixStateSingle)
-		fmt.Println(vmixStateMultiple, "\r")
 	}
 }
 
@@ -205,7 +282,7 @@ func ProcessMidi() {
 	for {
 		msg := <-midiMessageChan
 		button := int(msg[1])
-		var message string
+		var message []string
 
 		switch msg[0] {
 		case 144:
@@ -213,16 +290,31 @@ func ProcessMidi() {
 				// button pressed
 				fmt.Println("Button Down:", msg[1])
 				//Check overlayResponses to see if we have a match
-				if _, ok := overlayResponses[button]; ok {
+				if _, ok := respConfig[button]; ok {
 					ExecTextOverlay(button)
+				}
+
+				if _, ok := prayerConfig[button]; ok {
+					ExecPrayerOverlay(button)
+				}
+
+				if _, ok := scConfig[button]; ok {
+					for _, action := range scConfig[button].actionsPressed {
+						m := "FUNCTION " + action + "\r\n"
+						message = append(message, m)
+					}
 				}
 			}
 			if msg[2] == 0 {
 				//button released
 				fmt.Println("Button Up:", msg[1])
-				//Check overlayResponses to see if we have a match. If so remove the overlab
-				if _, ok := overlayResponses[button]; ok {
-					message = "FUNCTION OverlayInput1Out"
+				//Check respConfig to see if we have a match. If so remove the overlay
+				if _, ok := respConfig[button]; ok {
+					message = append(message, "FUNCTION OverlayInput1Out")
+				}
+
+				if _, ok := prayerConfig[button]; ok {
+					message = append(message, "FUNCTION OverlayInput1Out")
 				}
 			}
 
@@ -230,9 +322,50 @@ func ProcessMidi() {
 			// Fader moved
 			fmt.Println("Control change. Fader:", msg[1], "Value:", msg[2])
 		}
-		if message != "" {
+		if message != nil {
+			for _, mess := range message {
+				_ = SendMessage(mess)
+			}
+		}
+	}
+}
+
+func ExecTextOverlay(button int) {
+	var message string
+
+	if item, ok := respConfig[button]; ok {
+		input := strconv.Itoa(item.input)
+		//set the text
+		message = "FUNCTION SetText Input=" + input + "&SelectedName=" + url.QueryEscape(item.tbName) +
+			"&Value=" + url.QueryEscape(item.response)
+		_ = SendMessage(message)
+		fmt.Println(message)
+		//pause for 100 milliseconds to allow text to update in the title
+		d, _ := time.ParseDuration("100ms")
+		time.Sleep(d)
+		message = "FUNCTION OverlayInput1In Input=" + input
+		_ = SendMessage(message)
+	}
+}
+
+func ExecPrayerOverlay(button int) {
+	fmt.Println("Starting ExecPrayerOverlay")
+	var message string
+
+	if item, ok := prayerConfig[button]; ok {
+		input := strconv.Itoa(item.input)
+		message = "FUNCTION SetText Input=" + input + "&SelectedName=" + url.QueryEscape(item.tb1Name) +
+			"&Value=" + url.QueryEscape(item.text1)
+		_ = SendMessage(message)
+		if item.tb2Name != "" {
+			message = "FUNCTION SetText Input=" + input + "&SelectedName=" + url.QueryEscape(item.tb2Name) +
+				"&Value=" + url.QueryEscape(item.text2)
 			_ = SendMessage(message)
 		}
+		d, _ := time.ParseDuration("100ms")
+		time.Sleep(d)
+		message = "FUNCTION OverlayInput1In Input=" + input
+		_ = SendMessage(message)
 	}
 }
 
@@ -338,22 +471,6 @@ func getMIDIPorts() (midi.In, midi.Out) {
 	}
 }
 
-func ExecTextOverlay(button int) {
-	var message string
-
-	if item, ok := overlayResponses[button]; ok {
-		//set the text
-		message = "FUNCTION SetText Input=" + item.input + "&SelectedName=" + url.QueryEscape(item.tbName) +
-			"&Value=" + url.QueryEscape(item.response)
-		_ = SendMessage(message)
-		//pause for 100 milliseconds to allow text to update
-		d, _ := time.ParseDuration("100ms")
-		time.Sleep(d)
-		message = "FUNCTION OverlayInput1In Input=" + item.input
-		_ = SendMessage(message)
-	}
-}
-
 func main() {
 
 	wg.Add(2)
@@ -362,6 +479,8 @@ func main() {
 	defer midiOut.Close()
 	defer close(vmixMessageChan)
 	defer close(midiMessageChan)
+
+	go readConfig()
 
 	// Processes to listen to the vMix API and act on the messages
 	go getMessage()
