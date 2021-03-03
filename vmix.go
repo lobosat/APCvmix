@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"github.com/360EntSecGroup-Skylar/excelize/v2"
+	"github.com/davecgh/go-spew/spew"
 	"gitlab.com/gomidi/midi"
 	"gitlab.com/gomidi/midi/reader"
 	"gitlab.com/gomidi/midi/writer"
@@ -51,6 +52,24 @@ type vmixPrayerConfig struct {
 	text2   string
 }
 
+type apcLED struct {
+	buttons []int
+	color   string
+	state   string //on or off
+}
+
+type vmixActivatorConfig struct {
+	trigger   string
+	input     int
+	onAction  string
+	offAction string
+}
+
+type vmixFaderConfig struct {
+	fader string
+	input string
+}
+
 var vmixStateSingle = map[string]string{
 	"Input":        "",
 	"InputPreview": "",
@@ -73,6 +92,8 @@ var midiOut midi.Out
 var scConfig = make(map[int]*vmixSCConfig)
 var respConfig = make(map[int]*vmixRespConfig)
 var prayerConfig = make(map[int]*vmixPrayerConfig)
+var activatorConfig = make(map[string]*map[int]vmixActivatorConfig)
+var faderConfig = make(map[string]*vmixFaderConfig)
 
 func init() {
 	//Connect to the vmix API
@@ -84,6 +105,13 @@ func init() {
 
 	//Get the APC Mini MIDI In and Out ports
 	midiIn, midiOut = getMIDIPorts()
+
+	// Send a TALLY command to vMix to get the current setting of active and preview inputs
+	// (see ProcessVmixMessage function)
+	_ = SendMessage("TALLY")
+
+	// Turn off all LEDs on APC
+	setAllLed("off")
 }
 
 // readConfig is a blocking function that reads the "responses.xlsx" spreadsheet for configuration
@@ -140,14 +168,66 @@ func readConfig() {
 					pr.tb2Name = col[5]
 					pr.text2 = col[6]
 				}
-
 				prayerConfig[button] = pr
 			}
+		}
+
+		//Activators
+		// map[trigger][input][vmixActivatorConfig]
+		activatorCols, _ := wb.GetCols("Activators")
+
+		for i, col := range activatorCols {
+			if i > 0 && col != nil {
+				var onAction string
+				var offAction string
+				var trigger string
+				var input int
+				//col = truncateSlice(col)
+				//read the column in chunks of 3 lines, create a vmixActivatorConsole with the info, and
+				//add to the inputMap for that trigger
+				trigger = col[0]
+				inputMap := make(map[int]vmixActivatorConfig)
+				for i := 1; col[i] != ""; i = i + 3 {
+					input, _ = strconv.Atoi(col[i])
+					onAction = col[i+1]
+					offAction = col[i+2]
+					vmc := new(vmixActivatorConfig)
+					vmc.trigger = trigger
+					vmc.input = input
+					vmc.onAction = onAction
+					vmc.offAction = offAction
+					inputMap[input] = *vmc
+				}
+				activatorConfig[trigger] = &inputMap
+			}
+		}
+
+		// Faders
+		faderRows, _ := wb.GetRows("Faders")
+		for i := 1; i < len(faderRows); i++ {
+			row := faderRows[i]
+			fader := row[0]
+			input := row[1]
+			fc := new(vmixFaderConfig)
+			fc.fader = fader
+			fc.input = input
+			faderConfig[fader] = fc
 		}
 
 		duration, _ := time.ParseDuration("5s")
 		time.Sleep(duration)
 	}
+}
+
+// truncateSlice removes empty strings from a slice
+func truncateSlice(s []string) []string {
+	var r []string
+	for _, str := range s {
+		if str != "" {
+			r = append(r, str)
+		}
+	}
+	return r
 }
 
 // vmixAPIConnect connects to the vMix API. apiAddress is a string
@@ -225,26 +305,46 @@ func getMessage() {
 // conditional actions. This is a blocking function.
 func ProcessVmixMessage() {
 	for {
-		messageSlice := strings.Fields(<-vmixMessageChan)
+		vmixMessage := <-vmixMessageChan
+		messageSlice := strings.Fields(vmixMessage)
+		var input string
+		var state string
+
 		// ex:  [ACTS OK InputPlaying 9 1]
 		// messageSlice[2] - Action
 		// messageSlice[3] - Input
 		// messageSlice[4] - Value (usually 0 for off, 1 for on)
 
 		if messageSlice[0] == "ACTS" && messageSlice[1] == "OK" {
+			processActivator(vmixMessage)
 			parameter := messageSlice[2]
-			input := messageSlice[3]
-			state := messageSlice[4]
+
+			if len(messageSlice) == 4 {
+				state = messageSlice[3]
+			}
+
+			if len(messageSlice) == 5 {
+				input = messageSlice[3]
+				state = messageSlice[4]
+			}
+
 			switch parameter {
-			case "Input", "InputPreview", "Overlay1", "Overlay2", "Overlay3", "Overlay4":
+			case "Streaming", "Recording":
+				vmixStateSingle[parameter] = state
+
+			case "Input", "InputPreview", "Overlay1", "Overlay2", "Overlay3", "Overlay4", "":
+
 				if state == "1" {
+					// update vMix State Map
 					vmixStateSingle[parameter] = input
 				}
 				if state == "0" {
+					// update vMix State Map
 					if vmixStateSingle[parameter] == input {
 						vmixStateSingle[parameter] = ""
 					}
 				}
+
 			case "InputPlaying", "InputBusAAudio", "InputBusBAudio":
 				if state == "0" {
 					vmixStateMultiple[parameter][input] = false
@@ -253,8 +353,97 @@ func ProcessVmixMessage() {
 					vmixStateMultiple[parameter][input] = true
 				}
 			}
+
+		}
+
+		if messageSlice[0] == "TALLY" && messageSlice[1] == "OK" {
+			//Tally message received.  This tells us the current state of Active and Preview.  One is
+			//sent during initialization.  Use this to update the vMix state maps.  The tally string is a
+			//string of numbers.  The position in the string corresponds to the input number.  1 indicates that
+			//input is the active input, 2 indicates it is in Preview. Example:
+			//  TALLY OK 0000000000000000200000000001000000000
+			tally := messageSlice[2]
+			var i int
+
+			activeIdx := strings.Index(tally, "1")
+			previewIdx := strings.Index(tally, "2")
+
+			if activeIdx > -1 {
+				i = activeIdx + 1
+				vmixStateSingle["Input"] = strconv.Itoa(i)
+			}
+
+			if previewIdx > -1 {
+				i = previewIdx + 1
+				vmixStateSingle["InputPreview"] = strconv.Itoa(i)
+			}
 		}
 	}
+}
+
+func processActivator(vmixMessage string) {
+	messageSlice := strings.Fields(vmixMessage)
+	trigger := messageSlice[2]
+	var state string
+	var input int
+	var actions string
+
+	if len(messageSlice) == 5 {
+		state = messageSlice[4]
+		input, _ = strconv.Atoi(messageSlice[3])
+	}
+
+	if len(messageSlice) == 4 {
+		state = messageSlice[3]
+		input = 0
+	}
+
+	if _, ok := activatorConfig[trigger]; ok { //do we have an activator config for this trigger?
+		v := *activatorConfig[trigger]
+		if _, ok := v[input]; ok { //do we have an activator config for this trigger and input?
+			if state == "0" {
+				actions = v[input].offAction
+				actSlice := strings.Split(actions, ";")
+				if len(actSlice) > 0 {
+					for _, action := range actSlice {
+						act := strings.Split(action, ": ")
+						color := act[0]
+						buttons := strings.Split(act[1], ",")
+						iButtons := make([]int, len(buttons))
+						for i, s := range buttons {
+							iButtons[i], _ = strconv.Atoi(s)
+						}
+						apcLED := new(apcLED)
+						apcLED.buttons = iButtons
+						apcLED.color = color
+						setAPCLED(apcLED)
+					}
+				}
+			}
+
+			if state == "1" {
+				actions = v[input].onAction
+				actSlice := strings.Split(actions, ";")
+				if _, ok := v[input]; ok { //do we have an activator config for this trigger and input?
+					for _, action := range actSlice {
+						act := strings.Split(action, ": ")
+						color := act[0]
+						buttons := strings.Split(act[1], ",")
+						iButtons := make([]int, len(buttons))
+						for i, s := range buttons {
+							iButtons[i], _ = strconv.Atoi(s)
+						}
+						apcLED := new(apcLED)
+						apcLED.buttons = iButtons
+						apcLED.color = color
+						setAPCLED(apcLED)
+					}
+				}
+			}
+		}
+
+	}
+
 }
 
 // ExecVmixFunc executes a vMix function/action by writing to the API TCP port.  It takes
@@ -320,12 +509,45 @@ func ProcessMidi() {
 
 		case 176:
 			// Fader moved
-			fmt.Println("Control change. Fader:", msg[1], "Value:", msg[2])
+			fader := strconv.Itoa(int(msg[1]))
+
+			if _, ok := faderConfig[fader]; ok {
+				input := faderConfig[fader].input
+				value := int(msg[2])
+				volume := (value * 100) / 127 // SetVolume expects a value 0-100. APC gives 0-127
+				volumeS := strconv.Itoa(volume)
+				var m string
+
+				_, err := strconv.Atoi(input)
+				if err == nil {
+					//input is numeric. Set the volume on the appropriate input number
+					m = "FUNCTION SetVolume Input=" + input + "&Value=" + volumeS
+				} else {
+					//input is textual. Need to set a bus or master
+					if input == "Master" {
+						m = "FUNCTION SetMasterVolume Value=" + volumeS
+					}
+
+					if strings.Contains(input, "Bus") {
+						m = "FUNCTION Set" + input + "Volume Value=" + volumeS
+					}
+				}
+				if m != "" {
+					message = append(message, m)
+				}
+
+			}
 		}
+
 		if message != nil {
 			for _, mess := range message {
 				_ = SendMessage(mess)
 			}
+		}
+
+		if button == 98 {
+			spew.Dump(vmixStateSingle)
+			spew.Dump(vmixStateMultiple)
 		}
 	}
 }
@@ -393,7 +615,7 @@ func listenMidi() {
 // can be set to green, yellow, or red solid or binking. The round buttons
 // can only be on (solid red) or blink (blinking red).  The square button over
 // the rightmost fader does not appear to have any LEDs
-func setAPCLED(button uint8, color string) {
+func setAPCLED(led *apcLED) {
 	values := map[string]uint8{
 		"green":       1,
 		"greenBlink":  2,
@@ -406,11 +628,38 @@ func setAPCLED(button uint8, color string) {
 	}
 	wr := writer.New(midiOut)
 	wr.ConsolidateNotes(false)
-	if color == "off" {
-		_ = writer.NoteOff(wr, button)
-	} else {
-		_ = writer.NoteOn(wr, button, values[color])
+
+	for _, button := range led.buttons {
+		b := uint8(button)
+		if led.color == "off" {
+			_ = writer.NoteOff(wr, b)
+		} else {
+			_ = writer.NoteOn(wr, b, values[led.color])
+		}
 	}
+
+}
+
+func setAllLed(color string) {
+	led := new(apcLED)
+	min := 0
+	max := 71
+	a := make([]int, max-min+1)
+	for i := range a {
+		a[i] = min + i
+	}
+	led.color = color
+	led.buttons = a
+	setAPCLED(led)
+
+	min = 82
+	max = 89
+	a = make([]int, max-min+1)
+	for i := range a {
+		a[i] = min + i
+	}
+	led.buttons = a
+	setAPCLED(led)
 }
 
 // getMIDIPorts iterates through all midi ports on the driver and identifies the ones
@@ -477,6 +726,7 @@ func main() {
 	defer vmixClient.conn.Close()
 	defer midiIn.Close()
 	defer midiOut.Close()
+	defer setAllLed("off")
 	defer close(vmixMessageChan)
 	defer close(midiMessageChan)
 
@@ -485,8 +735,6 @@ func main() {
 	// Processes to listen to the vMix API and act on the messages
 	go getMessage()
 	go ProcessVmixMessage()
-
-	setAPCLED(7, "green")
 
 	// Listen to the APC Mini and act on button or control changes
 	go listenMidi()
