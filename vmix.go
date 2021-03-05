@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"github.com/360EntSecGroup-Skylar/excelize/v2"
+	"github.com/beevik/etree"
 	"github.com/davecgh/go-spew/spew"
 	"gitlab.com/gomidi/midi"
 	"gitlab.com/gomidi/midi/reader"
@@ -23,11 +24,6 @@ type vmixClientType struct {
 	r    *bufio.Reader
 	sync.Mutex
 	connected bool
-}
-type vmixFunc struct {
-	action string
-	input  string
-	value  string
 }
 
 type vmixRespConfig struct {
@@ -66,24 +62,47 @@ type vmixActivatorConfig struct {
 }
 
 type vmixFaderConfig struct {
-	fader string
+	fader int
 	input string
 }
 
-var vmixStateSingle = map[string]string{
-	"Input":        "",
-	"InputPreview": "",
-	"Overlay1":     "",
-	"Overlay2":     "",
-	"Overlay3":     "",
-	"Overlay4":     "",
+type vmixStateType struct {
+	Input            int
+	InputPreview     int
+	Overlay1         int
+	Overlay2         int
+	Overlay3         int
+	Overlay4         int
+	Overlay5         int
+	Overlay6         int
+	Streaming        int
+	Recording        int
+	InputPlaying     map[int]bool
+	InputMasterAudio map[int]bool
+	InputBusAAudio   map[int]bool
+	InputBusBAudio   map[int]bool
 }
+
+//var vmixStateSingle = map[string]string{
+//	"Input":        "",
+//	"InputPreview": "",
+//	"Overlay1":     "",
+//	"Overlay2":     "",
+//	"Overlay3":     "",
+//	"Overlay4":     "",
+//	"Overlay5":     "",
+//	"Overlay6":     "",
+//	"Streaming":    "",
+//	"Recording":    "",
+//}
 var vmixStateMultiple = map[string]map[string]bool{
-	"InputPlaying":   {},
-	"InputBusAAudio": {},
-	"InputBusBAudio": {},
+	"InputPlaying":     {},
+	"InputMasterAudio": {},
+	"InputBusAAudio":   {},
+	"InputBusBAudio":   {},
 }
 var vmixClient = new(vmixClientType)
+var vmixState = new(vmixStateType)
 var wg sync.WaitGroup
 var vmixMessageChan = make(chan string)
 var midiMessageChan = make(chan []byte, 100)
@@ -93,7 +112,7 @@ var scConfig = make(map[int]*vmixSCConfig)
 var respConfig = make(map[int]*vmixRespConfig)
 var prayerConfig = make(map[int]*vmixPrayerConfig)
 var activatorConfig = make(map[string]*map[int]vmixActivatorConfig)
-var faderConfig = make(map[string]*vmixFaderConfig)
+var faderConfig = make(map[int]*vmixFaderConfig)
 
 func init() {
 	//Connect to the vmix API
@@ -112,6 +131,112 @@ func init() {
 
 	// Turn off all LEDs on APC
 	setAllLed("off")
+
+	vmixState.InputBusAAudio = make(map[int]bool)
+	vmixState.InputBusBAudio = make(map[int]bool)
+	vmixState.InputMasterAudio = make(map[int]bool)
+	vmixState.InputPlaying = make(map[int]bool)
+
+	updateVmixState("192.168.1.173:8099")
+
+}
+
+//updateVmixState will create a connection to the vMix API and query it to update the
+//vMix state variables with the current configuration
+func updateVmixState(apiAddress string) {
+
+	t, _ := time.ParseDuration("2s")
+
+	conn, err := net.DialTimeout("tcp", apiAddress, t)
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+
+	w := bufio.NewWriter(conn)
+	r := bufio.NewReader(conn)
+
+	_, err = w.WriteString("XML\r\n")
+	if err == nil {
+		err = w.Flush()
+	}
+	var xml string
+	var cont bool
+	for cont = true; cont; {
+		line, _ := r.ReadString('\r')
+		if strings.Contains(line, "<vmix>") {
+			xml = xml + line
+		}
+		if strings.Contains(line, "</vmix>") {
+			xml = xml + line
+			cont = false
+		}
+	}
+
+	doc := etree.NewDocument()
+	_ = doc.ReadFromString(xml)
+
+	for _, overlays := range doc.FindElements("./vmix/overlays/*") {
+		number := overlays.SelectAttrValue("number", "")
+		input, _ := strconv.Atoi(overlays.Text())
+		if input > 0 {
+
+			switch number {
+			case "1":
+				vmixState.Overlay1 = input
+			case "2":
+				vmixState.Overlay1 = input
+			case "3":
+				vmixState.Overlay1 = input
+			case "4":
+				vmixState.Overlay1 = input
+			case "5":
+				vmixState.Overlay1 = input
+			case "6":
+				vmixState.Overlay1 = input
+			}
+		}
+	}
+
+	for _, inputs := range doc.FindElements("./vmix/inputs/*") {
+		busses := inputs.SelectAttrValue("audiobusses", "")
+		number, _ := strconv.Atoi(inputs.SelectAttrValue("number", ""))
+		inputType := inputs.SelectAttrValue("type", "")
+		state := inputs.SelectAttrValue("state", "")
+
+		if busses != "" {
+			if strings.Contains(busses, "A") {
+				//vmixStateMultiple["InputBusAAudio"] = map[string]bool{number: true}
+				vmixState.InputBusAAudio[number] = true
+			}
+			if strings.Contains(busses, "B") {
+				//vmixStateMultiple["InputBusBAudio"] = map[string]bool{number: true}
+				vmixState.InputBusBAudio[number] = true
+			}
+			if strings.Contains(busses, "M") {
+				//vmixStateMultiple["InputMasterAudio"] = map[string]bool{number: true}
+				vmixState.InputMasterAudio[number] = true
+			}
+		}
+
+		if inputType == "Video" && state == "Running" {
+			//vmixStateMultiple["InputPlaying"] = map[string]bool{number: true}
+			vmixState.InputPlaying[number] = true
+		}
+	}
+
+	streaming := doc.FindElement("/vmix/streaming").Text()
+	if streaming == "True" {
+		vmixState.Streaming = 1
+	} else {
+		vmixState.Streaming = 0
+	}
+	recording := doc.FindElement("/vmix/recording").Text()
+	if recording == "True" {
+		vmixState.Recording = 1
+	} else {
+		vmixState.Recording = 0
+	}
 }
 
 // readConfig is a blocking function that reads the "responses.xlsx" spreadsheet for configuration
@@ -206,7 +331,7 @@ func readConfig() {
 		faderRows, _ := wb.GetRows("Faders")
 		for i := 1; i < len(faderRows); i++ {
 			row := faderRows[i]
-			fader := row[0]
+			fader, _ := strconv.Atoi(row[0])
 			input := row[1]
 			fc := new(vmixFaderConfig)
 			fc.fader = fader
@@ -231,7 +356,7 @@ func truncateSlice(s []string) []string {
 }
 
 // vmixAPIConnect connects to the vMix API. apiAddress is a string
-// of the format ipaddress:port.  By default the vMix API is on port 8099.
+// of the format ipaddress:port.  By default, the vMix API is on port 8099.
 // If vMix is not up, this function will continue trying to connect, and will
 // block until a connection is achieved.
 func vmixAPIConnect(apiAddress string) error {
@@ -262,6 +387,7 @@ func vmixAPIConnect(apiAddress string) error {
 // SendMessage sends a message to the vMix API. It adds the
 // /r/n terminator the API expects
 func SendMessage(message string) error {
+	fmt.Println(message)
 	vmixClient.Lock()
 	pub := fmt.Sprintf("%v\r\n", message)
 	_, err := vmixClient.w.WriteString(pub)
@@ -269,14 +395,13 @@ func SendMessage(message string) error {
 		err = vmixClient.w.Flush()
 	}
 	vmixClient.Unlock()
-
 	return err
 }
 
 // getMessage connects to the vMix API and issues a subscription to activators.
 // It then remains listening for any messages from the API server.  Any messages
 // received are sent to the vmixMessageChan channel for consumption.  This is a blocking
-// function.  The vmixClient must already be connected to the API and available as a global.
+// function.  The vmixClient must already be connected to the API and available as a global object.
 func getMessage() {
 
 	// Subscribe to the activator feed in the vMix API
@@ -300,15 +425,15 @@ func getMessage() {
 	}
 }
 
-// ProcessVmixMessage listens to the vMix API channel for any messages from the API.
+// processVmixMessage listens to the vMix API channel for any messages from the API.
 // It uses these messages to update the vMix State maps which are used for the
 // conditional actions. This is a blocking function.
-func ProcessVmixMessage() {
+func processVmixMessage() {
 	for {
 		vmixMessage := <-vmixMessageChan
 		messageSlice := strings.Fields(vmixMessage)
-		var input string
-		var state string
+		var input int
+		var state int
 
 		// ex:  [ACTS OK InputPlaying 9 1]
 		// messageSlice[2] - Action
@@ -320,40 +445,82 @@ func ProcessVmixMessage() {
 			parameter := messageSlice[2]
 
 			if len(messageSlice) == 4 {
-				state = messageSlice[3]
+				state, _ = strconv.Atoi(messageSlice[3])
 			}
 
 			if len(messageSlice) == 5 {
-				input = messageSlice[3]
-				state = messageSlice[4]
+				input, _ = strconv.Atoi(messageSlice[3])
+				state, _ = strconv.Atoi(messageSlice[4])
 			}
 
 			switch parameter {
-			case "Streaming", "Recording":
-				vmixStateSingle[parameter] = state
-
-			case "Input", "InputPreview", "Overlay1", "Overlay2", "Overlay3", "Overlay4", "":
-
-				if state == "1" {
-					// update vMix State Map
-					vmixStateSingle[parameter] = input
+			case "Input":
+				vmixState.Input = input
+			case "InputPreview":
+				vmixState.InputPreview = input
+			case "Overlay1":
+				if state == 1 {
+					fmt.Println("Setting Overlay 1 to ", input)
+					vmixState.Overlay1 = input
+				} else {
+					vmixState.Overlay1 = 0
 				}
-				if state == "0" {
-					// update vMix State Map
-					if vmixStateSingle[parameter] == input {
-						vmixStateSingle[parameter] = ""
-					}
+			case "Overlay2":
+				if state == 1 {
+					vmixState.Overlay2 = input
+				} else {
+					vmixState.Overlay2 = 0
 				}
-
-			case "InputPlaying", "InputBusAAudio", "InputBusBAudio":
-				if state == "0" {
-					vmixStateMultiple[parameter][input] = false
+			case "Overlay3":
+				if state == 1 {
+					vmixState.Overlay3 = input
+				} else {
+					vmixState.Overlay3 = 0
 				}
-				if state == "1" {
-					vmixStateMultiple[parameter][input] = true
+			case "Overlay4":
+				if state == 1 {
+					vmixState.Overlay4 = input
+				} else {
+					vmixState.Overlay4 = 0
+				}
+			case "Overlay5":
+				if state == 1 {
+					vmixState.Overlay5 = input
+				} else {
+					vmixState.Overlay5 = 0
+				}
+			case "Overlay6":
+				if state == 1 {
+					vmixState.Overlay6 = input
+				} else {
+					vmixState.Overlay6 = 0
+				}
+			case "Streaming":
+				vmixState.Streaming = state
+			case "Recording":
+				vmixState.Recording = state
+			case "InputPlaying":
+				switch state {
+				case 0:
+					vmixState.InputPlaying = map[int]bool{input: false}
+				case 1:
+					vmixState.InputPlaying = map[int]bool{input: true}
+				}
+			case "InputBusAAudio":
+				switch state {
+				case 0:
+					vmixState.InputBusAAudio = map[int]bool{input: false}
+				case 1:
+					vmixState.InputBusAAudio = map[int]bool{input: true}
+				}
+			case "InputBusBAudio":
+				switch state {
+				case 0:
+					vmixState.InputBusBAudio = map[int]bool{input: false}
+				case 1:
+					vmixState.InputBusBAudio = map[int]bool{input: true}
 				}
 			}
-
 		}
 
 		if messageSlice[0] == "TALLY" && messageSlice[1] == "OK" {
@@ -370,12 +537,12 @@ func ProcessVmixMessage() {
 
 			if activeIdx > -1 {
 				i = activeIdx + 1
-				vmixStateSingle["Input"] = strconv.Itoa(i)
+				vmixState.Input = i
 			}
 
 			if previewIdx > -1 {
 				i = previewIdx + 1
-				vmixStateSingle["InputPreview"] = strconv.Itoa(i)
+				vmixState.InputPreview = i
 			}
 		}
 	}
@@ -446,24 +613,7 @@ func processActivator(vmixMessage string) {
 
 }
 
-// ExecVmixFunc executes a vMix function/action by writing to the API TCP port.  It takes
-// a vmixFunc type which includes the action (mandatory), and input and value if appropriate for
-// the action.
-func ExecVmixFunc(fn *vmixFunc) {
-	var message string
-
-	switch fn.action {
-	case "Merge":
-		message = "FUNCTION Merge Input=" + fn.input
-	}
-
-	err := SendMessage(message)
-	if err != nil {
-		fmt.Println("Unable to send message: ", err)
-	}
-}
-
-func ProcessMidi() {
+func processMidi() {
 	// message is a byte [type button velocity]
 	// type 144, velocity 0 is a button up
 	// type 144, velocity 127 is a button down
@@ -480,17 +630,21 @@ func ProcessMidi() {
 				fmt.Println("Button Down:", msg[1])
 				//Check overlayResponses to see if we have a match
 				if _, ok := respConfig[button]; ok {
-					ExecTextOverlay(button)
+					execTextOverlay(button)
 				}
 
 				if _, ok := prayerConfig[button]; ok {
-					ExecPrayerOverlay(button)
+					execPrayerOverlay(button)
 				}
 
 				if _, ok := scConfig[button]; ok {
 					for _, action := range scConfig[button].actionsPressed {
-						m := "FUNCTION " + action + "\r\n"
-						message = append(message, m)
+						if action == "dumpVars" {
+							spew.Dump("vmixStateSingle: ", vmixState)
+						} else {
+							m := "FUNCTION " + action + "\r\n"
+							message = append(message, m)
+						}
 					}
 				}
 			}
@@ -502,14 +656,19 @@ func ProcessMidi() {
 					message = append(message, "FUNCTION OverlayInput1Out")
 				}
 
-				if _, ok := prayerConfig[button]; ok {
-					message = append(message, "FUNCTION OverlayInput1Out")
+				if _, ok := scConfig[button]; ok {
+					for _, action := range scConfig[button].actionsReleased {
+						if action != "" {
+							m := "FUNCTION " + action + "\r\n"
+							message = append(message, m)
+						}
+					}
 				}
 			}
 
 		case 176:
 			// Fader moved
-			fader := strconv.Itoa(int(msg[1]))
+			fader := int(msg[1])
 
 			if _, ok := faderConfig[fader]; ok {
 				input := faderConfig[fader].input
@@ -544,15 +703,10 @@ func ProcessMidi() {
 				_ = SendMessage(mess)
 			}
 		}
-
-		if button == 98 {
-			spew.Dump(vmixStateSingle)
-			spew.Dump(vmixStateMultiple)
-		}
 	}
 }
 
-func ExecTextOverlay(button int) {
+func execTextOverlay(button int) {
 	var message string
 
 	if item, ok := respConfig[button]; ok {
@@ -570,24 +724,30 @@ func ExecTextOverlay(button int) {
 	}
 }
 
-func ExecPrayerOverlay(button int) {
-	fmt.Println("Starting ExecPrayerOverlay")
+func execPrayerOverlay(button int) {
 	var message string
 
 	if item, ok := prayerConfig[button]; ok {
 		input := strconv.Itoa(item.input)
-		message = "FUNCTION SetText Input=" + input + "&SelectedName=" + url.QueryEscape(item.tb1Name) +
-			"&Value=" + url.QueryEscape(item.text1)
-		_ = SendMessage(message)
-		if item.tb2Name != "" {
-			message = "FUNCTION SetText Input=" + input + "&SelectedName=" + url.QueryEscape(item.tb2Name) +
-				"&Value=" + url.QueryEscape(item.text2)
+
+		if vmixState.Overlay1 == item.input {
+			//Overlay is already displayed, remove it
+			message = "FUNCTION OverlayInput1Out"
+		} else {
+			// Display the overlay
+			message = "FUNCTION SetText Input=" + input + "&SelectedName=" + url.QueryEscape(item.tb1Name) +
+				"&Value=" + url.QueryEscape(item.text1)
+			_ = SendMessage(message)
+			if item.tb2Name != "" {
+				message = "FUNCTION SetText Input=" + input + "&SelectedName=" + url.QueryEscape(item.tb2Name) +
+					"&Value=" + url.QueryEscape(item.text2)
+				_ = SendMessage(message)
+			}
+			d, _ := time.ParseDuration("100ms")
+			time.Sleep(d)
+			message = "FUNCTION OverlayInput1In Input=" + input
 			_ = SendMessage(message)
 		}
-		d, _ := time.ParseDuration("100ms")
-		time.Sleep(d)
-		message = "FUNCTION OverlayInput1In Input=" + input
-		_ = SendMessage(message)
 	}
 }
 
@@ -612,7 +772,7 @@ func listenMidi() {
 }
 
 // setAPCLED sets the color of APC Mini buttons.  Rectangular buttons
-// can be set to green, yellow, or red solid or binking. The round buttons
+// can be set to green, yellow, or red solid or blinking. The round buttons
 // can only be on (solid red) or blink (blinking red).  The square button over
 // the rightmost fader does not appear to have any LEDs
 func setAPCLED(led *apcLED) {
@@ -623,8 +783,8 @@ func setAPCLED(led *apcLED) {
 		"redBlink":    4,
 		"yellow":      5,
 		"yellowBlink": 6,
-		"on":          1, // for round buttons - they can only be red(on)
-		"blink":       2, // or red blinking (blink)
+		"on":          1, // for round buttons - they can only be red/green (on)
+		"blink":       2, // or red/green blinking (blink)
 	}
 	wr := writer.New(midiOut)
 	wr.ConsolidateNotes(false)
@@ -734,11 +894,11 @@ func main() {
 
 	// Processes to listen to the vMix API and act on the messages
 	go getMessage()
-	go ProcessVmixMessage()
+	go processVmixMessage()
 
 	// Listen to the APC Mini and act on button or control changes
 	go listenMidi()
-	go ProcessMidi()
+	go processMidi()
 
 	wg.Wait()
 
