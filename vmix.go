@@ -26,20 +26,20 @@ type vmixClientType struct {
 	connected bool
 }
 
-type vmixRespConfig struct {
+type response struct {
 	button   int
 	input    int
 	tbName   string
 	response string
 }
 
-type vmixSCConfig struct {
+type shortcut struct {
 	button          int
 	actionsPressed  []string
 	actionsReleased []string
 }
 
-type vmixPrayerConfig struct {
+type prayer struct {
 	button  int
 	input   int
 	tb1Name string
@@ -48,19 +48,19 @@ type vmixPrayerConfig struct {
 	text2   string
 }
 
-type vmixActivatorConfig struct {
+type activator struct {
 	trigger   string
 	input     int
 	onAction  string
 	offAction string
 }
 
-type vmixFaderConfig struct {
+type fader struct {
 	fader int
 	input string
 }
 
-type vmixStateType struct {
+type state struct {
 	Input            int
 	InputPreview     int
 	Overlay1         int
@@ -88,14 +88,14 @@ type apcLEDS struct {
 }
 
 var vmixClient = new(vmixClientType)
-var vmixState = new(vmixStateType)
+var vmixState = new(state)
 var wg sync.WaitGroup
 var vmixMessageChan = make(chan string)
-var scConfig = make(map[int]*vmixSCConfig)
-var respConfig = make(map[int]*vmixRespConfig)
-var prayerConfig = make(map[int]*vmixPrayerConfig)
-var activatorConfig = make(map[string]*map[int]vmixActivatorConfig)
-var faderConfig = make(map[int]*vmixFaderConfig)
+var scConfig = make(map[int]*shortcut)
+var respConfig = make(map[int]*response)
+var prayerConfig = make(map[int]*prayer)
+var activatorConfig = make(map[string]*map[int]activator)
+var faderConfig = make(map[int]*fader)
 var midiOutChan = make(chan apcLEDS, 10)
 
 func init() {
@@ -238,7 +238,7 @@ func readConfig() {
 		for idx, row := range scRows {
 			if idx != 0 && row != nil {
 				btn, _ := strconv.Atoi(row[0])
-				cfg := new(vmixSCConfig)
+				cfg := new(shortcut)
 				cfg.button = btn
 				cfg.actionsPressed = strings.Split(row[1], "/n")
 				if len(row) == 3 {
@@ -254,7 +254,7 @@ func readConfig() {
 			if i != 0 && row != nil {
 				btn, _ := strconv.Atoi(row[0])
 				input, _ := strconv.Atoi(row[1])
-				or := new(vmixRespConfig)
+				or := new(response)
 				or.button = btn
 				or.input = input
 				or.tbName = row[2]
@@ -266,7 +266,7 @@ func readConfig() {
 		prayerCols, _ := wb.GetCols("Prayers")
 		for i, col := range prayerCols {
 			if i != 0 && col != nil {
-				pr := new(vmixPrayerConfig)
+				pr := new(prayer)
 				input, _ := strconv.Atoi(col[1])
 				button, _ := strconv.Atoi(col[2])
 				pr.input = input
@@ -295,19 +295,19 @@ func readConfig() {
 				//read the column in chunks of 3 lines, create a vmixActivatorConsole with the info, and
 				//add to the inputMap for that trigger
 				trigger = col[0]
-				inputMap := make(map[int]vmixActivatorConfig)
+				inputs := make(map[int]activator)
 				for i := 1; col[i] != ""; i = i + 3 {
 					input, _ = strconv.Atoi(col[i])
 					onAction = col[i+1]
 					offAction = col[i+2]
-					vmc := new(vmixActivatorConfig)
+					vmc := new(activator)
 					vmc.trigger = trigger
 					vmc.input = input
 					vmc.onAction = onAction
 					vmc.offAction = offAction
-					inputMap[input] = *vmc
+					inputs[input] = *vmc
 				}
-				activatorConfig[trigger] = &inputMap
+				activatorConfig[trigger] = &inputs
 			}
 		}
 
@@ -315,12 +315,12 @@ func readConfig() {
 		faderRows, _ := wb.GetRows("Faders")
 		for i := 1; i < len(faderRows); i++ {
 			row := faderRows[i]
-			fader, _ := strconv.Atoi(row[0])
+			faderNum, _ := strconv.Atoi(row[0])
 			input := row[1]
-			fc := new(vmixFaderConfig)
-			fc.fader = fader
+			fc := new(fader)
+			fc.fader = faderNum
 			fc.input = input
-			faderConfig[fader] = fc
+			faderConfig[faderNum] = fc
 		}
 
 		duration, _ := time.ParseDuration("5s")
