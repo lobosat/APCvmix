@@ -48,12 +48,6 @@ type vmixPrayerConfig struct {
 	text2   string
 }
 
-type apcLED struct {
-	buttons []int
-	color   string
-	state   string //on or off
-}
-
 type vmixActivatorConfig struct {
 	trigger   string
 	input     int
@@ -83,36 +77,26 @@ type vmixStateType struct {
 	InputBusBAudio   map[int]bool
 }
 
-//var vmixStateSingle = map[string]string{
-//	"Input":        "",
-//	"InputPreview": "",
-//	"Overlay1":     "",
-//	"Overlay2":     "",
-//	"Overlay3":     "",
-//	"Overlay4":     "",
-//	"Overlay5":     "",
-//	"Overlay6":     "",
-//	"Streaming":    "",
-//	"Recording":    "",
-//}
-var vmixStateMultiple = map[string]map[string]bool{
-	"InputPlaying":     {},
-	"InputMasterAudio": {},
-	"InputBusAAudio":   {},
-	"InputBusBAudio":   {},
+type midiPorts struct {
+	in  *midi.In
+	out *midi.Out
 }
+
+type apcLEDS struct {
+	buttons []int
+	color   string
+}
+
 var vmixClient = new(vmixClientType)
 var vmixState = new(vmixStateType)
 var wg sync.WaitGroup
 var vmixMessageChan = make(chan string)
-var midiMessageChan = make(chan []byte, 100)
-var midiIn midi.In
-var midiOut midi.Out
 var scConfig = make(map[int]*vmixSCConfig)
 var respConfig = make(map[int]*vmixRespConfig)
 var prayerConfig = make(map[int]*vmixPrayerConfig)
 var activatorConfig = make(map[string]*map[int]vmixActivatorConfig)
 var faderConfig = make(map[int]*vmixFaderConfig)
+var midiOutChan = make(chan apcLEDS, 10)
 
 func init() {
 	//Connect to the vmix API
@@ -123,7 +107,7 @@ func init() {
 	}
 
 	//Get the APC Mini MIDI In and Out ports
-	midiIn, midiOut = getMIDIPorts()
+	//midiIn, midiOut = getMIDIPorts()
 
 	// Send a TALLY command to vMix to get the current setting of active and preview inputs
 	// (see ProcessVmixMessage function)
@@ -137,7 +121,7 @@ func init() {
 	vmixState.InputMasterAudio = make(map[int]bool)
 	vmixState.InputPlaying = make(map[int]bool)
 
-	updateVmixState("192.168.1.173:8099")
+	//updateVmixState("192.168.1.173:8099")
 
 }
 
@@ -580,10 +564,15 @@ func processActivator(vmixMessage string) {
 						for i, s := range buttons {
 							iButtons[i], _ = strconv.Atoi(s)
 						}
-						apcLED := new(apcLED)
-						apcLED.buttons = iButtons
-						apcLED.color = color
-						setAPCLED(apcLED)
+						//apcLED := new(apcLED)
+						//apcLED.buttons = iButtons
+						//apcLED.color = color
+						//setAPCLED(apcLED)
+						leds := apcLEDS{
+							buttons: iButtons,
+							color:   color,
+						}
+						midiOutChan <- leds
 					}
 				}
 			}
@@ -600,10 +589,15 @@ func processActivator(vmixMessage string) {
 						for i, s := range buttons {
 							iButtons[i], _ = strconv.Atoi(s)
 						}
-						apcLED := new(apcLED)
-						apcLED.buttons = iButtons
-						apcLED.color = color
-						setAPCLED(apcLED)
+						//apcLED := new(apcLED)
+						//apcLED.buttons = iButtons
+						//apcLED.color = color
+						//setAPCLED(apcLED)
+						leds := apcLEDS{
+							buttons: iButtons,
+							color:   color,
+						}
+						midiOutChan <- leds
 					}
 				}
 			}
@@ -613,13 +607,13 @@ func processActivator(vmixMessage string) {
 
 }
 
-func processMidi() {
+func processMidi(midiInChan chan []byte) {
 	// message is a byte [type button velocity]
 	// type 144, velocity 0 is a button up
 	// type 144, velocity 127 is a button down
 	// type 176 is a control change
 	for {
-		msg := <-midiMessageChan
+		msg := <-midiInChan
 		button := int(msg[1])
 		var message []string
 
@@ -751,66 +745,72 @@ func execPrayerOverlay(button int) {
 	}
 }
 
-func listenMidi() {
-
-	rd := reader.New(
-		reader.NoLogger(),
-
-		// Fetch every message
-		reader.Each(func(pos *reader.Position, msg midi.Message) {
-			midiMessageChan <- msg.Raw()
-		}),
-	)
-
-	err := rd.ListenTo(midiIn)
-	if err == nil {
-		wg.Wait()
-	} else {
-		fmt.Println(err)
-		wg.Done()
-	}
-}
+//func listenMidi() {
+//
+//	rd := reader.New(
+//		reader.NoLogger(),
+//
+//		// Fetch every message
+//		reader.Each(func(pos *reader.Position, msg midi.Message) {
+//			midiMessageChan <- msg.Raw()
+//		}),
+//	)
+//
+//	err := rd.ListenTo(midiIn)
+//	if err == nil {
+//		wg.Wait()
+//	} else {
+//		fmt.Println(err)
+//		wg.Done()
+//	}
+//}
 
 // setAPCLED sets the color of APC Mini buttons.  Rectangular buttons
 // can be set to green, yellow, or red solid or blinking. The round buttons
 // can only be on (solid red) or blink (blinking red).  The square button over
 // the rightmost fader does not appear to have any LEDs
-func setAPCLED(led *apcLED) {
-	values := map[string]uint8{
-		"green":       1,
-		"greenBlink":  2,
-		"red":         3,
-		"redBlink":    4,
-		"yellow":      5,
-		"yellowBlink": 6,
-		"on":          1, // for round buttons - they can only be red/green (on)
-		"blink":       2, // or red/green blinking (blink)
-	}
-	wr := writer.New(midiOut)
-	wr.ConsolidateNotes(false)
-
-	for _, button := range led.buttons {
-		b := uint8(button)
-		if led.color == "off" {
-			_ = writer.NoteOff(wr, b)
-		} else {
-			_ = writer.NoteOn(wr, b, values[led.color])
-		}
-	}
-
-}
+//func setAPCLED(led *apcLED) {
+//	values := map[string]uint8{
+//		"green":       1,
+//		"greenBlink":  2,
+//		"red":         3,
+//		"redBlink":    4,
+//		"yellow":      5,
+//		"yellowBlink": 6,
+//		"on":          1, // for round buttons - they can only be red/green (on)
+//		"blink":       2, // or red/green blinking (blink)
+//	}
+//	wr := writer.New(midiOut)
+//	wr.ConsolidateNotes(false)
+//
+//	for _, button := range led.buttons {
+//		b := uint8(button)
+//		if led.color == "off" {
+//			_ = writer.NoteOff(wr, b)
+//		} else {
+//			_ = writer.NoteOn(wr, b, values[led.color])
+//		}
+//	}
+//
+//}
 
 func setAllLed(color string) {
-	led := new(apcLED)
+	//led := new(apcLED)
+
 	min := 0
 	max := 71
 	a := make([]int, max-min+1)
 	for i := range a {
 		a[i] = min + i
 	}
-	led.color = color
-	led.buttons = a
-	setAPCLED(led)
+	//led.color = color
+	//led.buttons = a
+	//setAPCLED(led)
+	leds := apcLEDS{
+		buttons: a,
+		color:   color,
+	}
+	midiOutChan <- leds
 
 	min = 82
 	max = 89
@@ -818,13 +818,73 @@ func setAllLed(color string) {
 	for i := range a {
 		a[i] = min + i
 	}
-	led.buttons = a
-	setAPCLED(led)
+	//led.buttons = a
+	//setAPCLED(led)
+	leds = apcLEDS{
+		buttons: a,
+		color:   color,
+	}
+	midiOutChan <- leds
 }
 
 // getMIDIPorts iterates through all midi ports on the driver and identifies the ones
 // belonging to an APC Mini.  Returns the input port and output port.
-func getMIDIPorts() (midi.In, midi.Out) {
+//func getMIDIPorts() (midi.In, midi.Out) {
+//	foundAPCIn := false
+//	foundAPCOut := false
+//
+//	drv, err := rtmididrv.New()
+//	if err != nil {
+//		panic(err)
+//	}
+//
+//	inPorts, _ := drv.Ins()
+//	outPorts, _ := drv.Outs()
+//
+//	inPort, err := midi.OpenIn(drv, 0, "")
+//	if err != nil {
+//		panic("No MIDI Input Ports found")
+//		return nil, nil
+//	}
+//
+//	outPort, err := midi.OpenOut(drv, 0, "")
+//	if err != nil {
+//		panic("No MIDI Output Ports found")
+//		return nil, nil
+//	}
+//
+//	for i, port := range inPorts {
+//		if strings.Contains(port.String(), "APC MINI") {
+//			inPort, err = midi.OpenIn(drv, i, "")
+//			if err != nil {
+//				panic("Unable to open MIDI In port")
+//				return nil, nil
+//			} else {
+//				foundAPCIn = true
+//			}
+//		}
+//	}
+//
+//	for i, port := range outPorts {
+//		if strings.Contains(port.String(), "APC MINI") {
+//			outPort, err = midi.OpenOut(drv, i, "")
+//			if err != nil {
+//				panic("Unable to open MIDI Out port")
+//				return nil, nil
+//			} else {
+//				foundAPCOut = true
+//			}
+//		}
+//	}
+//
+//	if foundAPCIn && foundAPCOut {
+//		return inPort, outPort
+//	} else {
+//		panic("No APC Mini found. Aborting")
+//		return nil, nil
+//	}
+//}
+func getMIDIPorts() (midiPort midiPorts) {
 	foundAPCIn := false
 	foundAPCOut := false
 
@@ -839,13 +899,13 @@ func getMIDIPorts() (midi.In, midi.Out) {
 	inPort, err := midi.OpenIn(drv, 0, "")
 	if err != nil {
 		panic("No MIDI Input Ports found")
-		return nil, nil
+		return
 	}
 
 	outPort, err := midi.OpenOut(drv, 0, "")
 	if err != nil {
 		panic("No MIDI Output Ports found")
-		return nil, nil
+		return
 	}
 
 	for i, port := range inPorts {
@@ -853,8 +913,9 @@ func getMIDIPorts() (midi.In, midi.Out) {
 			inPort, err = midi.OpenIn(drv, i, "")
 			if err != nil {
 				panic("Unable to open MIDI In port")
-				return nil, nil
+				return
 			} else {
+				fmt.Println("Inport Index:", i)
 				foundAPCIn = true
 			}
 		}
@@ -865,7 +926,7 @@ func getMIDIPorts() (midi.In, midi.Out) {
 			outPort, err = midi.OpenOut(drv, i, "")
 			if err != nil {
 				panic("Unable to open MIDI Out port")
-				return nil, nil
+				return
 			} else {
 				foundAPCOut = true
 			}
@@ -873,22 +934,84 @@ func getMIDIPorts() (midi.In, midi.Out) {
 	}
 
 	if foundAPCIn && foundAPCOut {
-		return inPort, outPort
+		midiPort.in = &inPort
+		midiPort.out = &outPort
+		return midiPort
 	} else {
 		panic("No APC Mini found. Aborting")
-		return nil, nil
+		return
+	}
+}
+
+func initMidi(midiInChan chan []byte, midiOutChan chan apcLEDS) {
+	var midiPort = new(midiPorts)
+
+	*midiPort = getMIDIPorts()
+	rd := reader.New(
+		reader.NoLogger(),
+
+		// Fetch every message
+		reader.Each(func(pos *reader.Position, msg midi.Message) {
+			midiInChan <- msg.Raw()
+		}),
+	)
+
+	err := rd.ListenTo(*midiPort.in)
+	if err != nil {
+		fmt.Println(err)
+		wg.Done()
+		return
+	}
+
+	//wr := writer.New(midiOut)
+	//wr.ConsolidateNotes(false)
+	for {
+		apcLED := <-midiOutChan
+		setAPCLED(apcLED, midiPort.out)
+	}
+}
+
+func pm(midiInChan chan []byte) {
+	for {
+		msg := <-midiInChan
+		fmt.Println(msg)
+	}
+}
+
+func setAPCLED(led apcLEDS, outPort *midi.Out) {
+	values := map[string]uint8{
+		"green":       1,
+		"greenBlink":  2,
+		"red":         3,
+		"redBlink":    4,
+		"yellow":      5,
+		"yellowBlink": 6,
+		"on":          1, // for round buttons - they can only be red/green (on)
+		"blink":       2, // or red/green blinking (blink)
+	}
+	wr := writer.New(*outPort)
+	wr.ConsolidateNotes(false)
+
+	for _, button := range led.buttons {
+		b := uint8(button)
+		if led.color == "off" {
+			_ = writer.NoteOff(wr, b)
+		} else {
+			_ = writer.NoteOn(wr, b, values[led.color])
+		}
 	}
 }
 
 func main() {
+	var midiInChan = make(chan []byte, 10)
 
 	wg.Add(2)
 	defer vmixClient.conn.Close()
-	defer midiIn.Close()
-	defer midiOut.Close()
-	defer setAllLed("off")
+	//defer midiIn.Close()
+	//defer midiOut.Close()
+	//defer setAllLed("off")
 	defer close(vmixMessageChan)
-	defer close(midiMessageChan)
+	defer close(midiInChan)
 
 	go readConfig()
 
@@ -897,8 +1020,10 @@ func main() {
 	go processVmixMessage()
 
 	// Listen to the APC Mini and act on button or control changes
-	go listenMidi()
-	go processMidi()
+	//go listenMidi()
+
+	go initMidi(midiInChan, midiOutChan)
+	go processMidi(midiInChan)
 
 	wg.Wait()
 
