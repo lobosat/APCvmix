@@ -18,12 +18,20 @@ import (
 	"time"
 )
 
-type vmixClientType struct {
-	conn net.Conn
-	w    *bufio.Writer
-	r    *bufio.Reader
-	sync.Mutex
-	connected bool
+type vmixClient struct {
+	conn        net.Conn
+	w           *bufio.Writer
+	r           *bufio.Reader
+	connected   bool
+	apiAddress  string
+	messageChan chan string
+	wg          *sync.WaitGroup
+}
+
+type vcConfig struct {
+	apiAddress  string
+	messageChan chan string
+	wg          *sync.WaitGroup
 }
 
 type response struct {
@@ -60,6 +68,14 @@ type fader struct {
 	input string
 }
 
+type config struct {
+	fader     fader
+	activator activator
+	prayer    prayer
+	shortcut  shortcut
+	response  response
+}
+
 type state struct {
 	Input            int
 	InputPreview     int
@@ -87,67 +103,34 @@ type apcLEDS struct {
 	color   string
 }
 
-var vmixClient = new(vmixClientType)
-var vmixState = new(state)
-var wg sync.WaitGroup
-var vmixMessageChan = make(chan string)
 var scConfig = make(map[int]*shortcut)
 var respConfig = make(map[int]*response)
 var prayerConfig = make(map[int]*prayer)
 var activatorConfig = make(map[string]*map[int]activator)
 var faderConfig = make(map[int]*fader)
-var midiOutChan = make(chan apcLEDS, 10)
 
-func init() {
-	//Connect to the vmix API
-	err := vmixAPIConnect("192.168.1.173:8099")
-	if err != nil {
-		fmt.Println("Error connecting to vmix API:")
-		panic(err)
-	}
-
-	//Get the APC Mini MIDI In and Out ports
-	//midiIn, midiOut = getMIDIPorts()
-
-	// Send a TALLY command to vMix to get the current setting of active and preview inputs
-	// (see ProcessVmixMessage function)
-	_ = SendMessage("TALLY")
-
-	// Turn off all LEDs on APC
-	setAllLed("off")
-
+func newState() state {
+	var vmixState = new(state)
 	vmixState.InputBusAAudio = make(map[int]bool)
 	vmixState.InputBusBAudio = make(map[int]bool)
 	vmixState.InputMasterAudio = make(map[int]bool)
 	vmixState.InputPlaying = make(map[int]bool)
-
-	//updateVmixState("192.168.1.173:8099")
-
+	return *vmixState
 }
 
 //updateVmixState will create a connection to the vMix API and query it to update the
 //vMix state variables with the current configuration
-func updateVmixState(apiAddress string) {
-
-	t, _ := time.ParseDuration("2s")
-
-	conn, err := net.DialTimeout("tcp", apiAddress, t)
-	if err != nil {
-		panic(err)
-	}
-	defer conn.Close()
-
-	w := bufio.NewWriter(conn)
-	r := bufio.NewReader(conn)
-
-	_, err = w.WriteString("XML\r\n")
+func updateVmixState(vc vcConfig) state {
+	client, _ := vmixAPIConnect(vc)
+	vmixState := newState()
+	_, err := client.w.WriteString("XML\r\n")
 	if err == nil {
-		err = w.Flush()
+		err = client.w.Flush()
 	}
 	var xml string
 	var cont bool
 	for cont = true; cont; {
-		line, _ := r.ReadString('\r')
+		line, _ := client.r.ReadString('\r')
 		if strings.Contains(line, "<vmix>") {
 			xml = xml + line
 		}
@@ -221,6 +204,14 @@ func updateVmixState(apiAddress string) {
 	} else {
 		vmixState.Recording = 0
 	}
+
+	active := doc.FindElement("/vmix/active").Text()
+	vmixState.Input, _ = strconv.Atoi(active)
+
+	preview := doc.FindElement("/vmix/preview").Text()
+	vmixState.InputPreview, _ = strconv.Atoi(preview)
+
+	return vmixState
 }
 
 // readConfig is a blocking function that reads the "responses.xlsx" spreadsheet for configuration
@@ -343,42 +334,47 @@ func truncateSlice(s []string) []string {
 // of the format ipaddress:port.  By default, the vMix API is on port 8099.
 // If vMix is not up, this function will continue trying to connect, and will
 // block until a connection is achieved.
-func vmixAPIConnect(apiAddress string) error {
-	vmixClient.connected = false
-	for vmixClient.connected == false {
+func vmixAPIConnect(vc vcConfig) (vmixClient, error) {
+	client := new(vmixClient)
+	client.connected = false
+	client.apiAddress = vc.apiAddress
+	client.wg = vc.wg
+	client.messageChan = vc.messageChan
+
+	for client.connected == false {
 		timeout, _ := time.ParseDuration("20s")
-		conn, err := net.DialTimeout("tcp", apiAddress, timeout)
+		conn, err := net.DialTimeout("tcp", client.apiAddress, timeout)
 
 		if err == nil {
-			vmixClient.conn = conn
-			vmixClient.w = bufio.NewWriter(conn)
-			vmixClient.r = bufio.NewReader(conn)
-			vmixClient.connected = true
+			client.conn = conn
+			client.w = bufio.NewWriter(conn)
+			client.r = bufio.NewReader(conn)
+			client.connected = true
 		} else if strings.Contains(err.Error(), "connection timed out") ||
 			strings.Contains(err.Error(), "connection refused") {
 			fmt.Println("vmix api is inaccessible.  Probably because vMix is not running")
 			fmt.Println("Waiting 5 seconds and trying again")
-			vmixClient.connected = false
+			client.connected = false
 			time.Sleep(5)
 		} else {
 			fmt.Println("Unable to connect. Error was: ", err)
-			return err
+			return *client, err
 		}
 	}
-	return nil
+	return *client, nil
 }
 
 // SendMessage sends a message to the vMix API. It adds the
 // /r/n terminator the API expects
-func SendMessage(message string) error {
+func SendMessage(client vmixClient, message string) error {
 	fmt.Println(message)
-	vmixClient.Lock()
+	//	client.Lock()
 	pub := fmt.Sprintf("%v\r\n", message)
-	_, err := vmixClient.w.WriteString(pub)
+	_, err := client.w.WriteString(pub)
 	if err == nil {
-		err = vmixClient.w.Flush()
+		err = client.w.Flush()
 	}
-	vmixClient.Unlock()
+	//	client.Unlock()
 	return err
 }
 
@@ -386,24 +382,24 @@ func SendMessage(message string) error {
 // It then remains listening for any messages from the API server.  Any messages
 // received are sent to the vmixMessageChan channel for consumption.  This is a blocking
 // function.  The vmixClient must already be connected to the API and available as a global object.
-func getMessage() {
+func getMessage(client vmixClient) {
 
 	// Subscribe to the activator feed in the vMix API
-	err := SendMessage("SUBSCRIBE ACTS")
+	err := SendMessage(client, "SUBSCRIBE ACTS")
 	if err != nil {
 		fmt.Println("Error in GetMessage.SendMessage: ", err)
-		wg.Done()
+		client.wg.Done()
 	}
 
 	//Capture all responses from the vMix API
 	for {
-		line, err := vmixClient.r.ReadString('\n')
+		line, err := client.r.ReadString('\n')
 
 		if err == nil {
-			vmixMessageChan <- line
+			client.messageChan <- line
 			fmt.Println(line)
 		} else {
-			wg.Done()
+			client.wg.Done()
 			fmt.Println("Error in GetMessage.ReadString: ", err)
 		}
 	}
@@ -412,20 +408,15 @@ func getMessage() {
 // processVmixMessage listens to the vMix API channel for any messages from the API.
 // It uses these messages to update the vMix State maps which are used for the
 // conditional actions. This is a blocking function.
-func processVmixMessage() {
+func processVmixMessage(client vmixClient, midiOutChan chan apcLEDS, vmixState state) {
 	for {
-		vmixMessage := <-vmixMessageChan
+		vmixMessage := <-client.messageChan
 		messageSlice := strings.Fields(vmixMessage)
 		var input int
 		var state int
 
-		// ex:  [ACTS OK InputPlaying 9 1]
-		// messageSlice[2] - Action
-		// messageSlice[3] - Input
-		// messageSlice[4] - Value (usually 0 for off, 1 for on)
-
 		if messageSlice[0] == "ACTS" && messageSlice[1] == "OK" {
-			processActivator(vmixMessage)
+			processActivator(vmixMessage, midiOutChan)
 			parameter := messageSlice[2]
 
 			if len(messageSlice) == 4 {
@@ -507,32 +498,10 @@ func processVmixMessage() {
 			}
 		}
 
-		if messageSlice[0] == "TALLY" && messageSlice[1] == "OK" {
-			//Tally message received.  This tells us the current state of Active and Preview.  One is
-			//sent during initialization.  Use this to update the vMix state maps.  The tally string is a
-			//string of numbers.  The position in the string corresponds to the input number.  1 indicates that
-			//input is the active input, 2 indicates it is in Preview. Example:
-			//  TALLY OK 0000000000000000200000000001000000000
-			tally := messageSlice[2]
-			var i int
-
-			activeIdx := strings.Index(tally, "1")
-			previewIdx := strings.Index(tally, "2")
-
-			if activeIdx > -1 {
-				i = activeIdx + 1
-				vmixState.Input = i
-			}
-
-			if previewIdx > -1 {
-				i = previewIdx + 1
-				vmixState.InputPreview = i
-			}
-		}
 	}
 }
 
-func processActivator(vmixMessage string) {
+func processActivator(vmixMessage string, midiOutChan chan apcLEDS) {
 	messageSlice := strings.Fields(vmixMessage)
 	trigger := messageSlice[2]
 	var state string
@@ -564,10 +533,7 @@ func processActivator(vmixMessage string) {
 						for i, s := range buttons {
 							iButtons[i], _ = strconv.Atoi(s)
 						}
-						//apcLED := new(apcLED)
-						//apcLED.buttons = iButtons
-						//apcLED.color = color
-						//setAPCLED(apcLED)
+
 						leds := apcLEDS{
 							buttons: iButtons,
 							color:   color,
@@ -589,10 +555,7 @@ func processActivator(vmixMessage string) {
 						for i, s := range buttons {
 							iButtons[i], _ = strconv.Atoi(s)
 						}
-						//apcLED := new(apcLED)
-						//apcLED.buttons = iButtons
-						//apcLED.color = color
-						//setAPCLED(apcLED)
+
 						leds := apcLEDS{
 							buttons: iButtons,
 							color:   color,
@@ -602,12 +565,10 @@ func processActivator(vmixMessage string) {
 				}
 			}
 		}
-
 	}
-
 }
 
-func processMidi(midiInChan chan []byte) {
+func processMidi(client vmixClient, midiInChan chan []byte, vmixState state) {
 	// message is a byte [type button velocity]
 	// type 144, velocity 0 is a button up
 	// type 144, velocity 127 is a button down
@@ -624,17 +585,17 @@ func processMidi(midiInChan chan []byte) {
 				fmt.Println("Button Down:", msg[1])
 				//Check overlayResponses to see if we have a match
 				if _, ok := respConfig[button]; ok {
-					execTextOverlay(button)
+					execTextOverlay(client, button)
 				}
 
 				if _, ok := prayerConfig[button]; ok {
-					execPrayerOverlay(button)
+					execPrayerOverlay(client, button, vmixState)
 				}
 
 				if _, ok := scConfig[button]; ok {
 					for _, action := range scConfig[button].actionsPressed {
 						if action == "dumpVars" {
-							spew.Dump("vmixStateSingle: ", vmixState)
+							spew.Dump("vmixState", vmixState)
 						} else {
 							m := "FUNCTION " + action + "\r\n"
 							message = append(message, m)
@@ -694,13 +655,13 @@ func processMidi(midiInChan chan []byte) {
 
 		if message != nil {
 			for _, mess := range message {
-				_ = SendMessage(mess)
+				_ = SendMessage(client, mess)
 			}
 		}
 	}
 }
 
-func execTextOverlay(button int) {
+func execTextOverlay(client vmixClient, button int) {
 	var message string
 
 	if item, ok := respConfig[button]; ok {
@@ -708,17 +669,17 @@ func execTextOverlay(button int) {
 		//set the text
 		message = "FUNCTION SetText Input=" + input + "&SelectedName=" + url.QueryEscape(item.tbName) +
 			"&Value=" + url.QueryEscape(item.response)
-		_ = SendMessage(message)
-		fmt.Println(message)
+		_ = SendMessage(client, message)
+		fmt.Println(client, message)
 		//pause for 100 milliseconds to allow text to update in the title
 		d, _ := time.ParseDuration("100ms")
 		time.Sleep(d)
 		message = "FUNCTION OverlayInput1In Input=" + input
-		_ = SendMessage(message)
+		_ = SendMessage(client, message)
 	}
 }
 
-func execPrayerOverlay(button int) {
+func execPrayerOverlay(client vmixClient, button int, vmixState state) {
 	var message string
 
 	if item, ok := prayerConfig[button]; ok {
@@ -731,71 +692,21 @@ func execPrayerOverlay(button int) {
 			// Display the overlay
 			message = "FUNCTION SetText Input=" + input + "&SelectedName=" + url.QueryEscape(item.tb1Name) +
 				"&Value=" + url.QueryEscape(item.text1)
-			_ = SendMessage(message)
+			_ = SendMessage(client, message)
 			if item.tb2Name != "" {
 				message = "FUNCTION SetText Input=" + input + "&SelectedName=" + url.QueryEscape(item.tb2Name) +
 					"&Value=" + url.QueryEscape(item.text2)
-				_ = SendMessage(message)
+				_ = SendMessage(client, message)
 			}
 			d, _ := time.ParseDuration("100ms")
 			time.Sleep(d)
 			message = "FUNCTION OverlayInput1In Input=" + input
-			_ = SendMessage(message)
+			_ = SendMessage(client, message)
 		}
 	}
 }
 
-//func listenMidi() {
-//
-//	rd := reader.New(
-//		reader.NoLogger(),
-//
-//		// Fetch every message
-//		reader.Each(func(pos *reader.Position, msg midi.Message) {
-//			midiMessageChan <- msg.Raw()
-//		}),
-//	)
-//
-//	err := rd.ListenTo(midiIn)
-//	if err == nil {
-//		wg.Wait()
-//	} else {
-//		fmt.Println(err)
-//		wg.Done()
-//	}
-//}
-
-// setAPCLED sets the color of APC Mini buttons.  Rectangular buttons
-// can be set to green, yellow, or red solid or blinking. The round buttons
-// can only be on (solid red) or blink (blinking red).  The square button over
-// the rightmost fader does not appear to have any LEDs
-//func setAPCLED(led *apcLED) {
-//	values := map[string]uint8{
-//		"green":       1,
-//		"greenBlink":  2,
-//		"red":         3,
-//		"redBlink":    4,
-//		"yellow":      5,
-//		"yellowBlink": 6,
-//		"on":          1, // for round buttons - they can only be red/green (on)
-//		"blink":       2, // or red/green blinking (blink)
-//	}
-//	wr := writer.New(midiOut)
-//	wr.ConsolidateNotes(false)
-//
-//	for _, button := range led.buttons {
-//		b := uint8(button)
-//		if led.color == "off" {
-//			_ = writer.NoteOff(wr, b)
-//		} else {
-//			_ = writer.NoteOn(wr, b, values[led.color])
-//		}
-//	}
-//
-//}
-
-func setAllLed(color string) {
-	//led := new(apcLED)
+func setAllLed(color string, midiOutChan chan apcLEDS) {
 
 	min := 0
 	max := 71
@@ -803,9 +714,7 @@ func setAllLed(color string) {
 	for i := range a {
 		a[i] = min + i
 	}
-	//led.color = color
-	//led.buttons = a
-	//setAPCLED(led)
+
 	leds := apcLEDS{
 		buttons: a,
 		color:   color,
@@ -818,8 +727,7 @@ func setAllLed(color string) {
 	for i := range a {
 		a[i] = min + i
 	}
-	//led.buttons = a
-	//setAPCLED(led)
+
 	leds = apcLEDS{
 		buttons: a,
 		color:   color,
@@ -827,84 +735,23 @@ func setAllLed(color string) {
 	midiOutChan <- leds
 }
 
-// getMIDIPorts iterates through all midi ports on the driver and identifies the ones
-// belonging to an APC Mini.  Returns the input port and output port.
-//func getMIDIPorts() (midi.In, midi.Out) {
-//	foundAPCIn := false
-//	foundAPCOut := false
-//
-//	drv, err := rtmididrv.New()
-//	if err != nil {
-//		panic(err)
-//	}
-//
-//	inPorts, _ := drv.Ins()
-//	outPorts, _ := drv.Outs()
-//
-//	inPort, err := midi.OpenIn(drv, 0, "")
-//	if err != nil {
-//		panic("No MIDI Input Ports found")
-//		return nil, nil
-//	}
-//
-//	outPort, err := midi.OpenOut(drv, 0, "")
-//	if err != nil {
-//		panic("No MIDI Output Ports found")
-//		return nil, nil
-//	}
-//
-//	for i, port := range inPorts {
-//		if strings.Contains(port.String(), "APC MINI") {
-//			inPort, err = midi.OpenIn(drv, i, "")
-//			if err != nil {
-//				panic("Unable to open MIDI In port")
-//				return nil, nil
-//			} else {
-//				foundAPCIn = true
-//			}
-//		}
-//	}
-//
-//	for i, port := range outPorts {
-//		if strings.Contains(port.String(), "APC MINI") {
-//			outPort, err = midi.OpenOut(drv, i, "")
-//			if err != nil {
-//				panic("Unable to open MIDI Out port")
-//				return nil, nil
-//			} else {
-//				foundAPCOut = true
-//			}
-//		}
-//	}
-//
-//	if foundAPCIn && foundAPCOut {
-//		return inPort, outPort
-//	} else {
-//		panic("No APC Mini found. Aborting")
-//		return nil, nil
-//	}
-//}
 func getMIDIPorts() (midiPort midiPorts) {
+	var inPort midi.In
+	var outPort midi.Out
 	foundAPCIn := false
 	foundAPCOut := false
 
 	drv, err := rtmididrv.New()
 	if err != nil {
-		panic(err)
+		fmt.Printf("Unable to open MIDI Driver")
+		return
 	}
 
 	inPorts, _ := drv.Ins()
 	outPorts, _ := drv.Outs()
 
-	inPort, err := midi.OpenIn(drv, 0, "")
-	if err != nil {
-		panic("No MIDI Input Ports found")
-		return
-	}
-
-	outPort, err := midi.OpenOut(drv, 0, "")
-	if err != nil {
-		panic("No MIDI Output Ports found")
+	if len(inPorts) == 0 || len(outPorts) == 0 {
+		fmt.Println("No MIDI ports found. Aborting")
 		return
 	}
 
@@ -912,10 +759,9 @@ func getMIDIPorts() (midiPort midiPorts) {
 		if strings.Contains(port.String(), "APC MINI") {
 			inPort, err = midi.OpenIn(drv, i, "")
 			if err != nil {
-				panic("Unable to open MIDI In port")
+				fmt.Printf("Unable to open APC MIDI In port")
 				return
 			} else {
-				fmt.Println("Inport Index:", i)
 				foundAPCIn = true
 			}
 		}
@@ -925,7 +771,7 @@ func getMIDIPorts() (midiPort midiPorts) {
 		if strings.Contains(port.String(), "APC MINI") {
 			outPort, err = midi.OpenOut(drv, i, "")
 			if err != nil {
-				panic("Unable to open MIDI Out port")
+				fmt.Println("Unable to open APC MIDI Out port")
 				return
 			} else {
 				foundAPCOut = true
@@ -959,22 +805,13 @@ func initMidi(midiInChan chan []byte, midiOutChan chan apcLEDS) {
 	err := rd.ListenTo(*midiPort.in)
 	if err != nil {
 		fmt.Println(err)
-		wg.Done()
+		//client.wg.Done()
 		return
 	}
 
-	//wr := writer.New(midiOut)
-	//wr.ConsolidateNotes(false)
 	for {
 		apcLED := <-midiOutChan
 		setAPCLED(apcLED, midiPort.out)
-	}
-}
-
-func pm(midiInChan chan []byte) {
-	for {
-		msg := <-midiInChan
-		fmt.Println(msg)
 	}
 }
 
@@ -1004,27 +841,32 @@ func setAPCLED(led apcLEDS, outPort *midi.Out) {
 
 func main() {
 	var midiInChan = make(chan []byte, 10)
+	var midiOutChan = make(chan apcLEDS, 10)
+
+	var wg sync.WaitGroup
+	vcConf := vcConfig{
+		apiAddress:  "192.168.1.173:8099",
+		messageChan: make(chan string),
+		wg:          &wg,
+	}
 
 	wg.Add(2)
-	defer vmixClient.conn.Close()
-	//defer midiIn.Close()
-	//defer midiOut.Close()
-	//defer setAllLed("off")
-	defer close(vmixMessageChan)
+
+	vmClient, _ := vmixAPIConnect(vcConf)
+
+	defer vmClient.conn.Close()
+	defer close(vmClient.messageChan)
 	defer close(midiInChan)
 
 	go readConfig()
+	vmixState := updateVmixState(vcConf)
+	setAllLed("off", midiOutChan)
 
-	// Processes to listen to the vMix API and act on the messages
-	go getMessage()
-	go processVmixMessage()
-
-	// Listen to the APC Mini and act on button or control changes
-	//go listenMidi()
+	go getMessage(vmClient)
+	go processVmixMessage(vmClient, midiOutChan, vmixState)
 
 	go initMidi(midiInChan, midiOutChan)
-	go processMidi(midiInChan)
+	go processMidi(vmClient, midiInChan, vmixState)
 
 	wg.Wait()
-
 }
