@@ -6,10 +6,12 @@ import (
 	"github.com/360EntSecGroup-Skylar/excelize/v2"
 	"github.com/beevik/etree"
 	"github.com/davecgh/go-spew/spew"
+	"github.com/fsnotify/fsnotify"
 	"gitlab.com/gomidi/midi"
 	"gitlab.com/gomidi/midi/reader"
 	"gitlab.com/gomidi/midi/writer"
 	"gitlab.com/gomidi/rtmididrv"
+	"log"
 	"net"
 	"net/url"
 	"strconv"
@@ -69,11 +71,11 @@ type fader struct {
 }
 
 type config struct {
-	fader     fader
-	activator activator
-	prayer    prayer
-	shortcut  shortcut
-	response  response
+	fader     map[int]*fader
+	activator map[string]*map[int]activator
+	prayer    map[int]*prayer
+	shortcut  map[int]*shortcut
+	response  map[int]*response
 }
 
 type state struct {
@@ -103,11 +105,22 @@ type apcLEDS struct {
 	color   string
 }
 
-var scConfig = make(map[int]*shortcut)
-var respConfig = make(map[int]*response)
-var prayerConfig = make(map[int]*prayer)
-var activatorConfig = make(map[string]*map[int]activator)
-var faderConfig = make(map[int]*fader)
+func newConfig() config {
+	var scConfig = make(map[int]*shortcut)
+	var respConfig = make(map[int]*response)
+	var prayerConfig = make(map[int]*prayer)
+	var activatorConfig = make(map[string]*map[int]activator)
+	var faderConfig = make(map[int]*fader)
+	conf := config{
+		fader:     faderConfig,
+		activator: activatorConfig,
+		prayer:    prayerConfig,
+		shortcut:  scConfig,
+		response:  respConfig,
+	}
+
+	return conf
+}
 
 func newState() state {
 	var vmixState = new(state)
@@ -116,6 +129,41 @@ func newState() state {
 	vmixState.InputMasterAudio = make(map[int]bool)
 	vmixState.InputPlaying = make(map[int]bool)
 	return *vmixState
+}
+
+func watchFile(file string) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer watcher.Close()
+
+	done := make(chan bool)
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				log.Println("event:", event)
+				if event.Op&fsnotify.Write == fsnotify.Write {
+					log.Println("modified file:", event.Name)
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				log.Println("error:", err)
+			}
+		}
+	}()
+
+	err = watcher.Add("/tmp/foo")
+	if err != nil {
+		log.Fatal(err)
+	}
+	<-done
 }
 
 //updateVmixState will create a connection to the vMix API and query it to update the
@@ -216,107 +264,106 @@ func updateVmixState(vc vcConfig) state {
 
 // readConfig is a blocking function that reads the "responses.xlsx" spreadsheet for configuration
 // of shortcuts, overlay text, etc.  This function is intended to run inside a go function.
-func readConfig() {
-	for {
-		wb, err := excelize.OpenFile("responses.xlsx")
-		if err != nil {
-			fmt.Println("Error opening workbook:", err)
-			return
-		}
+func readConfig() config {
 
-		//Shortcuts
-		scRows, _ := wb.GetRows("Shortcuts")
-		for idx, row := range scRows {
-			if idx != 0 && row != nil {
-				btn, _ := strconv.Atoi(row[0])
-				cfg := new(shortcut)
-				cfg.button = btn
-				cfg.actionsPressed = strings.Split(row[1], "/n")
-				if len(row) == 3 {
-					cfg.actionsReleased = strings.Split(row[2], ";")
-				}
-				scConfig[btn] = cfg
-			}
-		}
+	conf := newConfig()
 
-		// Responses
-		respRows, _ := wb.GetRows("Responses")
-		for i, row := range respRows {
-			if i != 0 && row != nil {
-				btn, _ := strconv.Atoi(row[0])
-				input, _ := strconv.Atoi(row[1])
-				or := new(response)
-				or.button = btn
-				or.input = input
-				or.tbName = row[2]
-				or.response = row[3]
-				respConfig[btn] = or
-			}
-		}
-		// Prayers
-		prayerCols, _ := wb.GetCols("Prayers")
-		for i, col := range prayerCols {
-			if i != 0 && col != nil {
-				pr := new(prayer)
-				input, _ := strconv.Atoi(col[1])
-				button, _ := strconv.Atoi(col[2])
-				pr.input = input
-				pr.button = button
-				pr.tb1Name = col[3]
-				pr.text1 = col[4]
-				if len(col) > 5 && col[5] != "----" {
-					pr.tb2Name = col[5]
-					pr.text2 = col[6]
-				}
-				prayerConfig[button] = pr
-			}
-		}
-
-		//Activators
-		// map[trigger][input][vmixActivatorConfig]
-		activatorCols, _ := wb.GetCols("Activators")
-
-		for i, col := range activatorCols {
-			if i > 0 && col != nil {
-				var onAction string
-				var offAction string
-				var trigger string
-				var input int
-				//col = truncateSlice(col)
-				//read the column in chunks of 3 lines, create a vmixActivatorConsole with the info, and
-				//add to the inputMap for that trigger
-				trigger = col[0]
-				inputs := make(map[int]activator)
-				for i := 1; col[i] != ""; i = i + 3 {
-					input, _ = strconv.Atoi(col[i])
-					onAction = col[i+1]
-					offAction = col[i+2]
-					vmc := new(activator)
-					vmc.trigger = trigger
-					vmc.input = input
-					vmc.onAction = onAction
-					vmc.offAction = offAction
-					inputs[input] = *vmc
-				}
-				activatorConfig[trigger] = &inputs
-			}
-		}
-
-		// Faders
-		faderRows, _ := wb.GetRows("Faders")
-		for i := 1; i < len(faderRows); i++ {
-			row := faderRows[i]
-			faderNum, _ := strconv.Atoi(row[0])
-			input := row[1]
-			fc := new(fader)
-			fc.fader = faderNum
-			fc.input = input
-			faderConfig[faderNum] = fc
-		}
-
-		duration, _ := time.ParseDuration("5s")
-		time.Sleep(duration)
+	wb, err := excelize.OpenFile("responses.xlsx")
+	if err != nil {
+		fmt.Println("Error opening workbook:", err)
+		return conf
 	}
+
+	//Shortcuts
+	scRows, _ := wb.GetRows("Shortcuts")
+	for idx, row := range scRows {
+		if idx != 0 && row != nil {
+			btn, _ := strconv.Atoi(row[0])
+			cfg := new(shortcut)
+			cfg.button = btn
+			cfg.actionsPressed = strings.Split(row[1], "/n")
+			if len(row) == 3 {
+				cfg.actionsReleased = strings.Split(row[2], ";")
+			}
+			conf.shortcut[btn] = cfg
+		}
+	}
+
+	// Responses
+	respRows, _ := wb.GetRows("Responses")
+	for i, row := range respRows {
+		if i != 0 && row != nil {
+			btn, _ := strconv.Atoi(row[0])
+			input, _ := strconv.Atoi(row[1])
+			or := new(response)
+			or.button = btn
+			or.input = input
+			or.tbName = row[2]
+			or.response = row[3]
+			conf.response[btn] = or
+		}
+	}
+	// Prayers
+	prayerCols, _ := wb.GetCols("Prayers")
+	for i, col := range prayerCols {
+		if i != 0 && col != nil {
+			pr := new(prayer)
+			input, _ := strconv.Atoi(col[1])
+			button, _ := strconv.Atoi(col[2])
+			pr.input = input
+			pr.button = button
+			pr.tb1Name = col[3]
+			pr.text1 = col[4]
+			if len(col) > 5 && col[5] != "----" {
+				pr.tb2Name = col[5]
+				pr.text2 = col[6]
+			}
+			conf.prayer[button] = pr
+		}
+	}
+
+	//Activators
+	// map[trigger][input][vmixActivatorConfig]
+	activatorCols, _ := wb.GetCols("Activators")
+
+	for i, col := range activatorCols {
+		if i > 0 && col != nil {
+			var onAction string
+			var offAction string
+			var trigger string
+			var input int
+			//col = truncateSlice(col)
+			//read the column in chunks of 3 lines, create a vmixActivatorConsole with the info, and
+			//add to the inputMap for that trigger
+			trigger = col[0]
+			inputs := make(map[int]activator)
+			for i := 1; col[i] != ""; i = i + 3 {
+				input, _ = strconv.Atoi(col[i])
+				onAction = col[i+1]
+				offAction = col[i+2]
+				vmc := new(activator)
+				vmc.trigger = trigger
+				vmc.input = input
+				vmc.onAction = onAction
+				vmc.offAction = offAction
+				inputs[input] = *vmc
+			}
+			conf.activator[trigger] = &inputs
+		}
+	}
+
+	// Faders
+	faderRows, _ := wb.GetRows("Faders")
+	for i := 1; i < len(faderRows); i++ {
+		row := faderRows[i]
+		faderNum, _ := strconv.Atoi(row[0])
+		input := row[1]
+		fc := new(fader)
+		fc.fader = faderNum
+		fc.input = input
+		conf.fader[faderNum] = fc
+	}
+	return conf
 }
 
 // truncateSlice removes empty strings from a slice
@@ -408,7 +455,7 @@ func getMessage(client vmixClient) {
 // processVmixMessage listens to the vMix API channel for any messages from the API.
 // It uses these messages to update the vMix State maps which are used for the
 // conditional actions. This is a blocking function.
-func processVmixMessage(client vmixClient, midiOutChan chan apcLEDS, vmixState state) {
+func processVmixMessage(client vmixClient, midiOutChan chan apcLEDS, vmixState state, conf config) {
 	for {
 		vmixMessage := <-client.messageChan
 		messageSlice := strings.Fields(vmixMessage)
@@ -416,7 +463,7 @@ func processVmixMessage(client vmixClient, midiOutChan chan apcLEDS, vmixState s
 		var state int
 
 		if messageSlice[0] == "ACTS" && messageSlice[1] == "OK" {
-			processActivator(vmixMessage, midiOutChan)
+			processActivator(vmixMessage, midiOutChan, conf)
 			parameter := messageSlice[2]
 
 			if len(messageSlice) == 4 {
@@ -501,7 +548,7 @@ func processVmixMessage(client vmixClient, midiOutChan chan apcLEDS, vmixState s
 	}
 }
 
-func processActivator(vmixMessage string, midiOutChan chan apcLEDS) {
+func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config) {
 	messageSlice := strings.Fields(vmixMessage)
 	trigger := messageSlice[2]
 	var state string
@@ -518,8 +565,8 @@ func processActivator(vmixMessage string, midiOutChan chan apcLEDS) {
 		input = 0
 	}
 
-	if _, ok := activatorConfig[trigger]; ok { //do we have an activator config for this trigger?
-		v := *activatorConfig[trigger]
+	if _, ok := conf.activator[trigger]; ok { //do we have an activator config for this trigger?
+		v := *conf.activator[trigger]
 		if _, ok := v[input]; ok { //do we have an activator config for this trigger and input?
 			if state == "0" {
 				actions = v[input].offAction
@@ -568,7 +615,7 @@ func processActivator(vmixMessage string, midiOutChan chan apcLEDS) {
 	}
 }
 
-func processMidi(client vmixClient, midiInChan chan []byte, vmixState state) {
+func processMidi(client vmixClient, midiInChan chan []byte, vmixState state, conf config) {
 	// message is a byte [type button velocity]
 	// type 144, velocity 0 is a button up
 	// type 144, velocity 127 is a button down
@@ -584,16 +631,16 @@ func processMidi(client vmixClient, midiInChan chan []byte, vmixState state) {
 				// button pressed
 				fmt.Println("Button Down:", msg[1])
 				//Check overlayResponses to see if we have a match
-				if _, ok := respConfig[button]; ok {
-					execTextOverlay(client, button)
+				if _, ok := conf.response[button]; ok {
+					execTextOverlay(client, button, conf)
 				}
 
-				if _, ok := prayerConfig[button]; ok {
-					execPrayerOverlay(client, button, vmixState)
+				if _, ok := conf.prayer[button]; ok {
+					execPrayerOverlay(client, button, vmixState, conf)
 				}
 
-				if _, ok := scConfig[button]; ok {
-					for _, action := range scConfig[button].actionsPressed {
+				if _, ok := conf.shortcut[button]; ok {
+					for _, action := range conf.shortcut[button].actionsPressed {
 						if action == "dumpVars" {
 							spew.Dump("vmixState", vmixState)
 						} else {
@@ -607,12 +654,12 @@ func processMidi(client vmixClient, midiInChan chan []byte, vmixState state) {
 				//button released
 				fmt.Println("Button Up:", msg[1])
 				//Check respConfig to see if we have a match. If so remove the overlay
-				if _, ok := respConfig[button]; ok {
+				if _, ok := conf.response[button]; ok {
 					message = append(message, "FUNCTION OverlayInput1Out")
 				}
 
-				if _, ok := scConfig[button]; ok {
-					for _, action := range scConfig[button].actionsReleased {
+				if _, ok := conf.shortcut[button]; ok {
+					for _, action := range conf.shortcut[button].actionsReleased {
 						if action != "" {
 							m := "FUNCTION " + action + "\r\n"
 							message = append(message, m)
@@ -625,8 +672,8 @@ func processMidi(client vmixClient, midiInChan chan []byte, vmixState state) {
 			// Fader moved
 			fader := int(msg[1])
 
-			if _, ok := faderConfig[fader]; ok {
-				input := faderConfig[fader].input
+			if _, ok := conf.fader[fader]; ok {
+				input := conf.fader[fader].input
 				value := int(msg[2])
 				volume := (value * 100) / 127 // SetVolume expects a value 0-100. APC gives 0-127
 				volumeS := strconv.Itoa(volume)
@@ -661,10 +708,10 @@ func processMidi(client vmixClient, midiInChan chan []byte, vmixState state) {
 	}
 }
 
-func execTextOverlay(client vmixClient, button int) {
+func execTextOverlay(client vmixClient, button int, conf config) {
 	var message string
 
-	if item, ok := respConfig[button]; ok {
+	if item, ok := conf.response[button]; ok {
 		input := strconv.Itoa(item.input)
 		//set the text
 		message = "FUNCTION SetText Input=" + input + "&SelectedName=" + url.QueryEscape(item.tbName) +
@@ -679,10 +726,10 @@ func execTextOverlay(client vmixClient, button int) {
 	}
 }
 
-func execPrayerOverlay(client vmixClient, button int, vmixState state) {
+func execPrayerOverlay(client vmixClient, button int, vmixState state, conf config) {
 	var message string
 
-	if item, ok := prayerConfig[button]; ok {
+	if item, ok := conf.prayer[button]; ok {
 		input := strconv.Itoa(item.input)
 
 		if vmixState.Overlay1 == item.input {
@@ -860,13 +907,15 @@ func main() {
 
 	go readConfig()
 	vmixState := updateVmixState(vcConf)
+	config := readConfig()
+
 	setAllLed("off", midiOutChan)
 
 	go getMessage(vmClient)
-	go processVmixMessage(vmClient, midiOutChan, vmixState)
+	go processVmixMessage(vmClient, midiOutChan, vmixState, config)
 
 	go initMidi(midiInChan, midiOutChan)
-	go processMidi(vmClient, midiInChan, vmixState)
+	go processMidi(vmClient, midiInChan, vmixState, config)
 
 	wg.Wait()
 }
