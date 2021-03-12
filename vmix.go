@@ -62,8 +62,8 @@ type prayer struct {
 type activator struct {
 	trigger   string
 	input     int
-	onAction  string
-	offAction string
+	onAction  []string
+	offAction []string
 }
 
 type fader struct {
@@ -288,8 +288,8 @@ func newConfig() config {
 
 	for i, col := range activatorCols {
 		if i > 0 && col != nil {
-			var onAction string
-			var offAction string
+			var onActions []string
+			var offActions []string
 			var trigger string
 			var input int
 			//col = truncateSlice(col)
@@ -299,13 +299,13 @@ func newConfig() config {
 			inputs := make(map[int]activator)
 			for i := 1; col[i] != ""; i = i + 3 {
 				input, _ = strconv.Atoi(col[i])
-				onAction = col[i+1]
-				offAction = col[i+2]
+				onActions = strings.Split(col[i+1], "\n")
+				offActions = strings.Split(col[i+2], "\n")
 				vmc := new(activator)
 				vmc.trigger = trigger
 				vmc.input = input
-				vmc.onAction = onAction
-				vmc.offAction = offAction
+				vmc.onAction = onActions
+				vmc.offAction = offActions
 				inputs[input] = *vmc
 			}
 			conf.activator[trigger] = &inputs
@@ -416,24 +416,22 @@ func updateConfig(conf *config, fileName string) {
 
 	for i, col := range activatorCols {
 		if i > 0 && col != nil {
-			var onAction string
-			var offAction string
+			var onActions []string
+			var offActions []string
 			var trigger string
 			var input int
-			//col = truncateSlice(col)
-			//read the column in chunks of 3 lines, create a vmixActivatorConsole with the info, and
-			//add to the inputMap for that trigger
+
 			trigger = col[0]
 			inputs := make(map[int]activator)
 			for i := 1; col[i] != ""; i = i + 3 {
 				input, _ = strconv.Atoi(col[i])
-				onAction = col[i+1]
-				offAction = col[i+2]
+				onActions = strings.Split(col[i+1], "\n")
+				offActions = strings.Split(col[i+2], "\n")
 				vmc := new(activator)
 				vmc.trigger = trigger
 				vmc.input = input
-				vmc.onAction = onAction
-				vmc.offAction = offAction
+				vmc.onAction = onActions
+				vmc.offAction = offActions
 				inputs[input] = *vmc
 			}
 			conf.activator[trigger] = &inputs
@@ -630,7 +628,7 @@ func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config)
 	trigger := messageSlice[2]
 	var state string
 	var input int
-	var actions string
+	var actions []string
 
 	if len(messageSlice) == 5 {
 		state = messageSlice[4]
@@ -647,46 +645,41 @@ func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config)
 		if _, ok := v[input]; ok { //do we have an activator config for this trigger and input?
 			if state == "0" {
 				actions = v[input].offAction
-				actSlice := strings.Split(actions, ";")
-				if len(actSlice) > 0 {
-					for _, action := range actSlice {
-						act := strings.Split(action, ": ")
-						color := act[0]
-						buttons := strings.Split(act[1], ",")
-						iButtons := make([]int, len(buttons))
-						for i, s := range buttons {
-							iButtons[i], _ = strconv.Atoi(s)
-						}
-
-						leds := apcLEDS{
-							buttons: iButtons,
-							color:   color,
-						}
-						midiOutChan <- leds
+				for _, action := range actions {
+					fmt.Println(action)
+					act := strings.Split(action, ": ")
+					color := act[0]
+					buttons := strings.Split(act[1], ",")
+					iButtons := make([]int, len(buttons))
+					for i, s := range buttons {
+						iButtons[i], _ = strconv.Atoi(s)
 					}
+
+					leds := apcLEDS{
+						buttons: iButtons,
+						color:   color,
+					}
+					midiOutChan <- leds
 				}
 			}
+		}
 
-			if state == "1" {
-				actions = v[input].onAction
-				actSlice := strings.Split(actions, ";")
-				if _, ok := v[input]; ok { //do we have an activator config for this trigger and input?
-					for _, action := range actSlice {
-						act := strings.Split(action, ": ")
-						color := act[0]
-						buttons := strings.Split(act[1], ",")
-						iButtons := make([]int, len(buttons))
-						for i, s := range buttons {
-							iButtons[i], _ = strconv.Atoi(s)
-						}
-
-						leds := apcLEDS{
-							buttons: iButtons,
-							color:   color,
-						}
-						midiOutChan <- leds
-					}
+		if state == "1" {
+			actions = v[input].onAction
+			for _, action := range actions {
+				act := strings.Split(action, ": ")
+				color := act[0]
+				buttons := strings.Split(act[1], ",")
+				iButtons := make([]int, len(buttons))
+				for i, s := range buttons {
+					iButtons[i], _ = strconv.Atoi(s)
 				}
+
+				leds := apcLEDS{
+					buttons: iButtons,
+					color:   color,
+				}
+				midiOutChan <- leds
 			}
 		}
 	}
