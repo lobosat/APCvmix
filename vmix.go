@@ -28,6 +28,7 @@ type vmixClient struct {
 	apiAddress  string
 	messageChan chan string
 	wg          *sync.WaitGroup
+	lock        sync.RWMutex
 }
 
 type vcConfig struct {
@@ -240,9 +241,9 @@ func newConfig() config {
 			btn, _ := strconv.Atoi(row[0])
 			cfg := new(shortcut)
 			cfg.button = btn
-			cfg.actionsPressed = strings.Split(row[1], "/n")
+			cfg.actionsPressed = strings.Split(row[1], "\n")
 			if len(row) == 3 {
-				cfg.actionsReleased = strings.Split(row[2], ";")
+				cfg.actionsReleased = strings.Split(row[2], "\n")
 			}
 			conf.shortcut[btn] = cfg
 		}
@@ -340,7 +341,6 @@ func watchConfigFile(conf *config, fileName string) {
 			case err := <-w.Error:
 				log.Fatalln(err)
 			case <-w.Closed:
-				fmt.Println("Watcher closed")
 				return
 			}
 		}
@@ -358,7 +358,6 @@ func watchConfigFile(conf *config, fileName string) {
 // updateConfig will update the current config variable by re-reading the configuration spreadsheet.  It is
 // intended to be called by a file watcher whenever the configuration sheet is changed.
 func updateConfig(conf *config, fileName string) {
-	fmt.Println("Updating config")
 	wb, err := excelize.OpenFile(fileName)
 	if err != nil {
 		fmt.Println("Error opening workbook:", err)
@@ -371,9 +370,9 @@ func updateConfig(conf *config, fileName string) {
 			btn, _ := strconv.Atoi(row[0])
 			cfg := new(shortcut)
 			cfg.button = btn
-			cfg.actionsPressed = strings.Split(row[1], "/n")
+			cfg.actionsPressed = strings.Split(row[1], "\n")
 			if len(row) == 3 {
-				cfg.actionsReleased = strings.Split(row[2], ";")
+				cfg.actionsReleased = strings.Split(row[2], "\n")
 			}
 			conf.shortcut[btn] = cfg
 		}
@@ -454,22 +453,11 @@ func updateConfig(conf *config, fileName string) {
 	}
 }
 
-// truncateSlice removes empty strings from a slice
-func truncateSlice(s []string) []string {
-	var r []string
-	for _, str := range s {
-		if str != "" {
-			r = append(r, str)
-		}
-	}
-	return r
-}
-
 // vmixAPIConnect connects to the vMix API. apiAddress is a string
 // of the format ipaddress:port.  By default, the vMix API is on port 8099.
 // If vMix is not up, this function will continue trying to connect, and will
 // block until a connection is achieved.
-func vmixAPIConnect(vc vcConfig) (vmixClient, error) {
+func vmixAPIConnect(vc vcConfig) (*vmixClient, error) {
 	client := new(vmixClient)
 	client.connected = false
 	client.apiAddress = vc.apiAddress
@@ -493,23 +481,23 @@ func vmixAPIConnect(vc vcConfig) (vmixClient, error) {
 			time.Sleep(5)
 		} else {
 			fmt.Println("Unable to connect. Error was: ", err)
-			return *client, err
+			return client, err
 		}
 	}
-	return *client, nil
+	return client, nil
 }
 
 // SendMessage sends a message to the vMix API. It adds the
 // /r/n terminator the API expects
-func SendMessage(client vmixClient, message string) error {
-	fmt.Println(message)
-	//	client.Lock()
+func SendMessage(client *vmixClient, message string) error {
+
+	//	client.lock.Lock()
 	pub := fmt.Sprintf("%v\r\n", message)
 	_, err := client.w.WriteString(pub)
 	if err == nil {
 		err = client.w.Flush()
 	}
-	//	client.Unlock()
+
 	return err
 }
 
@@ -517,9 +505,10 @@ func SendMessage(client vmixClient, message string) error {
 // It then remains listening for any messages from the API server.  Any messages
 // received are sent to the vmixMessageChan channel for consumption.  This is a blocking
 // function.  The vmixClient must already be connected to the API and available as a global object.
-func getMessage(client vmixClient) {
+func getMessage(client *vmixClient) {
 
 	// Subscribe to the activator feed in the vMix API
+
 	err := SendMessage(client, "SUBSCRIBE ACTS")
 	if err != nil {
 		fmt.Println("Error in GetMessage.SendMessage: ", err)
@@ -543,7 +532,7 @@ func getMessage(client vmixClient) {
 // processVmixMessage listens to the vMix API channel for any messages from the API.
 // It uses these messages to update the vMix State maps which are used for the
 // conditional actions. This is a blocking function.
-func processVmixMessage(client vmixClient, midiOutChan chan apcLEDS, vmixState state, conf config) {
+func processVmixMessage(client *vmixClient, midiOutChan chan apcLEDS, vmixState state, conf config) {
 	for {
 		vmixMessage := <-client.messageChan
 		messageSlice := strings.Fields(vmixMessage)
@@ -570,7 +559,6 @@ func processVmixMessage(client vmixClient, midiOutChan chan apcLEDS, vmixState s
 				vmixState.InputPreview = input
 			case "Overlay1":
 				if state == 1 {
-					fmt.Println("Setting Overlay 1 to ", input)
 					vmixState.Overlay1 = input
 				} else {
 					vmixState.Overlay1 = 0
@@ -637,6 +625,7 @@ func processVmixMessage(client vmixClient, midiOutChan chan apcLEDS, vmixState s
 }
 
 func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config) {
+
 	messageSlice := strings.Fields(vmixMessage)
 	trigger := messageSlice[2]
 	var state string
@@ -703,7 +692,7 @@ func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config)
 	}
 }
 
-func processMidi(client vmixClient, midiInChan chan []byte, vmixState state, conf config) {
+func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, client *vmixClient, vmixState state, conf config) {
 	// message is a byte [type button velocity]
 	// type 144, velocity 0 is a button up
 	// type 144, velocity 127 is a button down
@@ -729,11 +718,26 @@ func processMidi(client vmixClient, midiInChan chan []byte, vmixState state, con
 
 				if _, ok := conf.shortcut[button]; ok {
 					for _, action := range conf.shortcut[button].actionsPressed {
+
 						if action == "dumpVars" {
 							spew.Dump("vmixState", vmixState)
 							spew.Dump("Config", conf)
+						} else if strings.HasPrefix(action, "leds") {
+							// ex: leds green 1,2,3
+							parts := strings.Split(action, " ")
+							color := parts[1]
+							leds := strings.Split(parts[2], ",")
+							iLeds := make([]int, len(leds))
+							for i, s := range leds {
+								iLeds[i], _ = strconv.Atoi(s)
+							}
+							apc := apcLEDS{
+								buttons: iLeds,
+								color:   color,
+							}
+							midiOutChan <- apc
 						} else {
-							m := "FUNCTION " + action + "\r\n"
+							m := "FUNCTION " + action
 							message = append(message, m)
 						}
 					}
@@ -750,8 +754,24 @@ func processMidi(client vmixClient, midiInChan chan []byte, vmixState state, con
 				if _, ok := conf.shortcut[button]; ok {
 					for _, action := range conf.shortcut[button].actionsReleased {
 						if action != "" {
-							m := "FUNCTION " + action + "\r\n"
-							message = append(message, m)
+							if strings.HasPrefix(action, "leds") {
+								// ex: leds green 1,2,3
+								parts := strings.Split(action, " ")
+								color := parts[1]
+								leds := strings.Split(parts[2], ",")
+								iLeds := make([]int, len(leds))
+								for i, s := range leds {
+									iLeds[i], _ = strconv.Atoi(s)
+								}
+								apc := apcLEDS{
+									buttons: iLeds,
+									color:   color,
+								}
+								midiOutChan <- apc
+							} else {
+								m := "FUNCTION " + action + "\r\n"
+								message = append(message, m)
+							}
 						}
 					}
 				}
@@ -797,7 +817,7 @@ func processMidi(client vmixClient, midiInChan chan []byte, vmixState state, con
 	}
 }
 
-func execTextOverlay(client vmixClient, button int, conf config) {
+func execTextOverlay(client *vmixClient, button int, conf config) {
 	var message string
 
 	if item, ok := conf.response[button]; ok {
@@ -806,7 +826,6 @@ func execTextOverlay(client vmixClient, button int, conf config) {
 		message = "FUNCTION SetText Input=" + input + "&SelectedName=" + url.QueryEscape(item.tbName) +
 			"&Value=" + url.QueryEscape(item.response)
 		_ = SendMessage(client, message)
-		fmt.Println(client, message)
 		//pause for 100 milliseconds to allow text to update in the title
 		d, _ := time.ParseDuration("100ms")
 		time.Sleep(d)
@@ -815,7 +834,7 @@ func execTextOverlay(client vmixClient, button int, conf config) {
 	}
 }
 
-func execPrayerOverlay(client vmixClient, button int, vmixState state, conf config) {
+func execPrayerOverlay(client *vmixClient, button int, vmixState state, conf config) {
 	var message string
 
 	if item, ok := conf.prayer[button]; ok {
@@ -1008,7 +1027,7 @@ func main() {
 	go processVmixMessage(vmClient, midiOutChan, vmixState, config)
 
 	go initMidi(midiInChan, midiOutChan)
-	go processMidi(vmClient, midiInChan, vmixState, config)
+	go processMidi(midiInChan, midiOutChan, vmClient, vmixState, config)
 
 	wg.Add(2)
 	wg.Wait()
