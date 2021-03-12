@@ -6,7 +6,7 @@ import (
 	"github.com/360EntSecGroup-Skylar/excelize/v2"
 	"github.com/beevik/etree"
 	"github.com/davecgh/go-spew/spew"
-	"github.com/fsnotify/fsnotify"
+	"github.com/radovskyb/watcher"
 	"gitlab.com/gomidi/midi"
 	"gitlab.com/gomidi/midi/reader"
 	"gitlab.com/gomidi/midi/writer"
@@ -105,23 +105,6 @@ type apcLEDS struct {
 	color   string
 }
 
-func newConfig() config {
-	var scConfig = make(map[int]*shortcut)
-	var respConfig = make(map[int]*response)
-	var prayerConfig = make(map[int]*prayer)
-	var activatorConfig = make(map[string]*map[int]activator)
-	var faderConfig = make(map[int]*fader)
-	conf := config{
-		fader:     faderConfig,
-		activator: activatorConfig,
-		prayer:    prayerConfig,
-		shortcut:  scConfig,
-		response:  respConfig,
-	}
-
-	return conf
-}
-
 func newState() state {
 	var vmixState = new(state)
 	vmixState.InputBusAAudio = make(map[int]bool)
@@ -131,43 +114,8 @@ func newState() state {
 	return *vmixState
 }
 
-func watchFile(file string) {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer watcher.Close()
-
-	done := make(chan bool)
-	go func() {
-		for {
-			select {
-			case event, ok := <-watcher.Events:
-				if !ok {
-					return
-				}
-				log.Println("event:", event)
-				if event.Op&fsnotify.Write == fsnotify.Write {
-					log.Println("modified file:", event.Name)
-				}
-			case err, ok := <-watcher.Errors:
-				if !ok {
-					return
-				}
-				log.Println("error:", err)
-			}
-		}
-	}()
-
-	err = watcher.Add("/tmp/foo")
-	if err != nil {
-		log.Fatal(err)
-	}
-	<-done
-}
-
-//updateVmixState will create a connection to the vMix API and query it to update the
-//vMix state variables with the current configuration
+// updateVmixState will create a connection to the vMix API and query it to update the
+// vMix state variables with the current configuration
 func updateVmixState(vc vcConfig) state {
 	client, _ := vmixAPIConnect(vc)
 	vmixState := newState()
@@ -262,11 +210,22 @@ func updateVmixState(vc vcConfig) state {
 	return vmixState
 }
 
-// readConfig is a blocking function that reads the "responses.xlsx" spreadsheet for configuration
-// of shortcuts, overlay text, etc.  This function is intended to run inside a go function.
-func readConfig() config {
+// newConfig initializes the configuration variable and loads it with the content of the configuration
+// spreadsheet.  It returns the new configuration variable
+func newConfig() config {
 
-	conf := newConfig()
+	var scConfig = make(map[int]*shortcut)
+	var respConfig = make(map[int]*response)
+	var prayerConfig = make(map[int]*prayer)
+	var activatorConfig = make(map[string]*map[int]activator)
+	var faderConfig = make(map[int]*fader)
+	conf := config{
+		fader:     faderConfig,
+		activator: activatorConfig,
+		prayer:    prayerConfig,
+		shortcut:  scConfig,
+		response:  respConfig,
+	}
 
 	wb, err := excelize.OpenFile("responses.xlsx")
 	if err != nil {
@@ -364,6 +323,135 @@ func readConfig() config {
 		conf.fader[faderNum] = fc
 	}
 	return conf
+}
+
+// watchConfigFile watches the configuration spreadsheet (responses.xlsx) for any changes (write).
+// If any changes are detected it will reload the conf variable with the new data.
+func watchConfigFile(conf *config, fileName string) {
+	w := watcher.New()
+
+	go func() {
+		for {
+			select {
+			case event := <-w.Event:
+				if event.Op.String() == "WRITE" {
+					updateConfig(conf, fileName)
+				}
+			case err := <-w.Error:
+				log.Fatalln(err)
+			case <-w.Closed:
+				fmt.Println("Watcher closed")
+				return
+			}
+		}
+	}()
+
+	if err := w.Add(fileName); err != nil {
+		log.Fatalln(err)
+	}
+	if err := w.Start(time.Millisecond * 100); err != nil {
+		log.Fatalln(err)
+	}
+
+}
+
+// updateConfig will update the current config variable by re-reading the configuration spreadsheet.  It is
+// intended to be called by a file watcher whenever the configuration sheet is changed.
+func updateConfig(conf *config, fileName string) {
+	fmt.Println("Updating config")
+	wb, err := excelize.OpenFile(fileName)
+	if err != nil {
+		fmt.Println("Error opening workbook:", err)
+	}
+
+	//Shortcuts
+	scRows, _ := wb.GetRows("Shortcuts")
+	for idx, row := range scRows {
+		if idx != 0 && row != nil {
+			btn, _ := strconv.Atoi(row[0])
+			cfg := new(shortcut)
+			cfg.button = btn
+			cfg.actionsPressed = strings.Split(row[1], "/n")
+			if len(row) == 3 {
+				cfg.actionsReleased = strings.Split(row[2], ";")
+			}
+			conf.shortcut[btn] = cfg
+		}
+	}
+
+	// Responses
+	respRows, _ := wb.GetRows("Responses")
+	for i, row := range respRows {
+		if i != 0 && row != nil {
+			btn, _ := strconv.Atoi(row[0])
+			input, _ := strconv.Atoi(row[1])
+			or := new(response)
+			or.button = btn
+			or.input = input
+			or.tbName = row[2]
+			or.response = row[3]
+			conf.response[btn] = or
+		}
+	}
+	// Prayers
+	prayerCols, _ := wb.GetCols("Prayers")
+	for i, col := range prayerCols {
+		if i != 0 && col != nil {
+			pr := new(prayer)
+			input, _ := strconv.Atoi(col[1])
+			button, _ := strconv.Atoi(col[2])
+			pr.input = input
+			pr.button = button
+			pr.tb1Name = col[3]
+			pr.text1 = col[4]
+			if len(col) > 5 && col[5] != "----" {
+				pr.tb2Name = col[5]
+				pr.text2 = col[6]
+			}
+			conf.prayer[button] = pr
+		}
+	}
+
+	//Activators
+	activatorCols, _ := wb.GetCols("Activators")
+
+	for i, col := range activatorCols {
+		if i > 0 && col != nil {
+			var onAction string
+			var offAction string
+			var trigger string
+			var input int
+			//col = truncateSlice(col)
+			//read the column in chunks of 3 lines, create a vmixActivatorConsole with the info, and
+			//add to the inputMap for that trigger
+			trigger = col[0]
+			inputs := make(map[int]activator)
+			for i := 1; col[i] != ""; i = i + 3 {
+				input, _ = strconv.Atoi(col[i])
+				onAction = col[i+1]
+				offAction = col[i+2]
+				vmc := new(activator)
+				vmc.trigger = trigger
+				vmc.input = input
+				vmc.onAction = onAction
+				vmc.offAction = offAction
+				inputs[input] = *vmc
+			}
+			conf.activator[trigger] = &inputs
+		}
+	}
+
+	// Faders
+	faderRows, _ := wb.GetRows("Faders")
+	for i := 1; i < len(faderRows); i++ {
+		row := faderRows[i]
+		faderNum, _ := strconv.Atoi(row[0])
+		input := row[1]
+		fc := new(fader)
+		fc.fader = faderNum
+		fc.input = input
+		conf.fader[faderNum] = fc
+	}
 }
 
 // truncateSlice removes empty strings from a slice
@@ -643,6 +731,7 @@ func processMidi(client vmixClient, midiInChan chan []byte, vmixState state, con
 					for _, action := range conf.shortcut[button].actionsPressed {
 						if action == "dumpVars" {
 							spew.Dump("vmixState", vmixState)
+							spew.Dump("Config", conf)
 						} else {
 							m := "FUNCTION " + action + "\r\n"
 							message = append(message, m)
@@ -887,17 +976,21 @@ func setAPCLED(led apcLEDS, outPort *midi.Out) {
 }
 
 func main() {
+	const (
+		apiAddress = "192.168.1.173:8099" // address and port for the vMix TCP API
+		fileName   = "./responses.xlsx"   // path and filename to the configuration spreadsheet
+	)
+
 	var midiInChan = make(chan []byte, 10)
 	var midiOutChan = make(chan apcLEDS, 10)
-
+	var messageChan = make(chan string)
 	var wg sync.WaitGroup
+
 	vcConf := vcConfig{
-		apiAddress:  "192.168.1.173:8099",
-		messageChan: make(chan string),
+		apiAddress:  apiAddress,
+		messageChan: messageChan,
 		wg:          &wg,
 	}
-
-	wg.Add(2)
 
 	vmClient, _ := vmixAPIConnect(vcConf)
 
@@ -905,9 +998,9 @@ func main() {
 	defer close(vmClient.messageChan)
 	defer close(midiInChan)
 
-	go readConfig()
 	vmixState := updateVmixState(vcConf)
-	config := readConfig()
+	config := newConfig()
+	go watchConfigFile(&config, fileName)
 
 	setAllLed("off", midiOutChan)
 
@@ -917,5 +1010,6 @@ func main() {
 	go initMidi(midiInChan, midiOutChan)
 	go processMidi(vmClient, midiInChan, vmixState, config)
 
+	wg.Add(2)
 	wg.Wait()
 }
