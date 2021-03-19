@@ -20,6 +20,8 @@ import (
 	"time"
 )
 
+const DEBUG = true
+
 type vmixClient struct {
 	conn        net.Conn
 	w           *bufio.Writer
@@ -104,6 +106,12 @@ type midiPorts struct {
 type apcLEDS struct {
 	buttons []int
 	color   string
+}
+
+func debug(msg ...interface{}) {
+	if DEBUG {
+		fmt.Println(msg)
+	}
 }
 
 func newState() state {
@@ -472,8 +480,9 @@ func vmixAPIConnect(vc vcConfig) (*vmixClient, error) {
 			client.r = bufio.NewReader(conn)
 			client.connected = true
 		} else if strings.Contains(err.Error(), "connection timed out") ||
-			strings.Contains(err.Error(), "connection refused") {
-			fmt.Println("vmix api is inaccessible.  Probably because vMix is not running")
+			strings.Contains(err.Error(), "connection refused") ||
+			strings.Contains(err.Error(), "timeout") {
+			fmt.Println("vmix api is inaccessible.  Probably because vMix is not running. Error received is:", err)
 			fmt.Println("Waiting 5 seconds and trying again")
 			client.connected = false
 			time.Sleep(5)
@@ -489,7 +498,6 @@ func vmixAPIConnect(vc vcConfig) (*vmixClient, error) {
 // /r/n terminator the API expects
 func SendMessage(client *vmixClient, message string) error {
 
-	//	client.lock.Lock()
 	pub := fmt.Sprintf("%v\r\n", message)
 	_, err := client.w.WriteString(pub)
 	if err == nil {
@@ -519,7 +527,7 @@ func getMessage(client *vmixClient) {
 
 		if err == nil {
 			client.messageChan <- line
-			fmt.Println(line)
+			debug(line)
 		} else {
 			client.wg.Done()
 			fmt.Println("Error in GetMessage.ReadString: ", err)
@@ -646,7 +654,7 @@ func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config)
 			if state == "0" {
 				actions = v[input].offAction
 				for _, action := range actions {
-					fmt.Println(action)
+					debug(action)
 					act := strings.Split(action, ": ")
 					color := act[0]
 					buttons := strings.Split(act[1], ",")
@@ -699,7 +707,7 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, client *vmixC
 		case 144:
 			if msg[2] == 127 {
 				// button pressed
-				fmt.Println("Button Down:", msg[1])
+				debug("Button Down:", msg[1])
 				//Check overlayResponses to see if we have a match
 				if _, ok := conf.response[button]; ok {
 					execTextOverlay(client, button, conf)
@@ -738,7 +746,7 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, client *vmixC
 			}
 			if msg[2] == 0 {
 				//button released
-				fmt.Println("Button Up:", msg[1])
+				debug("Button Up:", msg[1])
 				//Check respConfig to see if we have a match. If so remove the overlay
 				if _, ok := conf.response[button]; ok {
 					message = append(message, "FUNCTION OverlayInput1Out")
@@ -941,6 +949,7 @@ func initMidi(midiInChan chan []byte, midiOutChan chan apcLEDS) {
 	var midiPort = new(midiPorts)
 
 	*midiPort = getMIDIPorts()
+
 	rd := reader.New(
 		reader.NoLogger(),
 
@@ -1006,10 +1015,6 @@ func main() {
 
 	vmClient, _ := vmixAPIConnect(vcConf)
 
-	defer vmClient.conn.Close()
-	defer close(vmClient.messageChan)
-	defer close(midiInChan)
-
 	vmixState := updateVmixState(vcConf)
 	config := newConfig()
 	go watchConfigFile(&config, fileName)
@@ -1021,6 +1026,10 @@ func main() {
 
 	go initMidi(midiInChan, midiOutChan)
 	go processMidi(midiInChan, midiOutChan, vmClient, vmixState, config)
+
+	defer vmClient.conn.Close()
+	defer close(vmClient.messageChan)
+	defer close(midiInChan)
 
 	wg.Add(2)
 	wg.Wait()
