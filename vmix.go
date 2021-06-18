@@ -911,9 +911,10 @@ func getMIDIPorts() (midiPort midiPorts) {
 		return
 	}
 
-	for i, port := range inPorts {
+	for _, port := range inPorts {
+
 		if strings.Contains(port.String(), "APC MINI") {
-			inPort, err = midi.OpenIn(drv, i, "")
+			inPort, err = midi.OpenIn(drv, port.Number(), "")
 			if err != nil {
 				fmt.Printf("Unable to open APC MIDI In port")
 				return
@@ -923,9 +924,10 @@ func getMIDIPorts() (midiPort midiPorts) {
 		}
 	}
 
-	for i, port := range outPorts {
+	for _, port := range outPorts {
+
 		if strings.Contains(port.String(), "APC MINI") {
-			outPort, err = midi.OpenOut(drv, i, "")
+			outPort, err = midi.OpenOut(drv, port.Number(), "")
 			if err != nil {
 				fmt.Println("Unable to open APC MIDI Out port")
 				return
@@ -943,6 +945,10 @@ func getMIDIPorts() (midiPort midiPorts) {
 		panic("No APC Mini found. Aborting")
 		return
 	}
+}
+
+func printPort(port midi.Port) {
+	fmt.Printf("[%v] %s\n", port.Number(), port.String())
 }
 
 func initMidi(midiInChan chan []byte, midiOutChan chan apcLEDS) {
@@ -998,8 +1004,8 @@ func setAPCLED(led apcLEDS, outPort *midi.Out) {
 
 func main() {
 	const (
-		apiAddress = "192.168.1.173:8099" // address and port for the vMix TCP API
-		fileName   = "./responses.xlsx"   // path and filename to the configuration spreadsheet
+		apiAddress = "127.0.0.1:8099"   // address and port for the vMix TCP API
+		fileName   = "./responses.xlsx" // path and filename to the configuration spreadsheet
 	)
 
 	var midiInChan = make(chan []byte, 10)
