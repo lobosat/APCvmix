@@ -108,6 +108,54 @@ type apcLEDS struct {
 	color   string
 }
 
+// Translate from the APC midi mapping (0 is left button on last row
+// to more logical numbering where 1 is the top-left button
+var hButton = []int{
+	57, 58, 59, 60, 61, 62, 63, 64, //Rectangular buttons
+	49, 50, 51, 52, 53, 54, 55, 56,
+	41, 42, 43, 44, 45, 46, 47, 48,
+	33, 34, 35, 36, 37, 38, 39, 40,
+	24, 26, 27, 28, 29, 30, 31, 32,
+	17, 18, 19, 20, 21, 22, 23, 24,
+	9, 10, 11, 12, 13, 14, 15, 16,
+	1, 2, 3, 4, 5, 6, 7, 8,
+	65, 66, 67, 68, 69, 70, 71, 72, //Horizontal round buttons
+	99, 99, 99, 99, 99, 99, 99, 99,
+	99, 99,
+	73, 74, 75, 76, 77, 78, 79, 80, //Vertical round buttons
+	99, 99, 99, 99, 99, 99, 99, 99,
+	81, // Square button
+}
+
+// Translate from more logical numbering to
+// APC midi mapping.
+var oButton = []int{
+	99, 56, 57, 58, 59, 60, 61, 62, 63,
+	48, 49, 50, 51, 52, 53, 54, 55,
+	40, 41, 42, 43, 44, 45, 46, 47,
+	32, 33, 34, 35, 36, 37, 38, 39,
+	24, 25, 26, 27, 28, 29, 30, 31,
+	16, 17, 18, 19, 20, 21, 22, 23,
+	8, 9, 10, 11, 12, 13, 14, 15,
+	0, 1, 2, 3, 4, 5, 6, 7,
+	65, 66, 67, 68, 69, 70, 71, 72,
+	73, 74, 75, 76, 77, 78, 79, 80,
+	99, 99, 99, 99, 99, 99, 99, 99,
+	81,
+}
+
+var oFader = map[int]int{
+	48: 1,
+	49: 2,
+	50: 3,
+	51: 4,
+	52: 5,
+	53: 6,
+	54: 7,
+	55: 8,
+	56: 9,
+}
+
 func debug(msg ...interface{}) {
 	if DEBUG {
 		fmt.Println(msg)
@@ -245,12 +293,12 @@ func newConfig() config {
 	//Shortcuts
 	scRows, _ := wb.GetRows("Shortcuts")
 	for idx, row := range scRows {
-		if idx != 0 && row != nil {
+		if idx != 0 && len(row) > 1 {
 			btn, _ := strconv.Atoi(row[0])
 			cfg := new(shortcut)
 			cfg.button = btn
 			cfg.actionsPressed = strings.Split(row[1], "\n")
-			if len(row) == 3 {
+			if len(row) > 2 {
 				cfg.actionsReleased = strings.Split(row[2], "\n")
 			}
 			conf.shortcut[btn] = cfg
@@ -260,7 +308,7 @@ func newConfig() config {
 	// Responses
 	respRows, _ := wb.GetRows("Responses")
 	for i, row := range respRows {
-		if i != 0 && row != nil {
+		if i != 0 && len(row) > 1 {
 			btn, _ := strconv.Atoi(row[0])
 			input, _ := strconv.Atoi(row[1])
 			or := new(response)
@@ -277,16 +325,16 @@ func newConfig() config {
 		if i != 0 && col != nil {
 			pr := new(prayer)
 			input, _ := strconv.Atoi(col[1])
-			button, _ := strconv.Atoi(col[2])
+			btn, _ := strconv.Atoi(col[2])
 			pr.input = input
-			pr.button = button
+			pr.button = btn
 			pr.tb1Name = col[3]
 			pr.text1 = col[4]
 			if len(col) > 5 && col[5] != "----" {
 				pr.tb2Name = col[5]
 				pr.text2 = col[6]
 			}
-			conf.prayer[button] = pr
+			conf.prayer[btn] = pr
 		}
 	}
 
@@ -300,7 +348,7 @@ func newConfig() config {
 			var offActions []string
 			var trigger string
 			var input int
-			//col = truncateSlice(col)
+
 			//read the column in chunks of 3 lines, create a vmixActivatorConsole with the info, and
 			//add to the inputMap for that trigger
 			trigger = col[0]
@@ -374,12 +422,12 @@ func updateConfig(conf *config, fileName string) {
 	//Shortcuts
 	scRows, _ := wb.GetRows("Shortcuts")
 	for idx, row := range scRows {
-		if idx != 0 && row != nil {
+		if idx != 0 && row != nil && len(row) > 1 {
 			btn, _ := strconv.Atoi(row[0])
 			cfg := new(shortcut)
 			cfg.button = btn
 			cfg.actionsPressed = strings.Split(row[1], "\n")
-			if len(row) == 3 {
+			if len(row) > 2 {
 				cfg.actionsReleased = strings.Split(row[2], "\n")
 			}
 			conf.shortcut[btn] = cfg
@@ -393,11 +441,11 @@ func updateConfig(conf *config, fileName string) {
 			btn, _ := strconv.Atoi(row[0])
 			input, _ := strconv.Atoi(row[1])
 			or := new(response)
-			or.button = btn
+			or.button = hButton[btn]
 			or.input = input
 			or.tbName = row[2]
 			or.response = row[3]
-			conf.response[btn] = or
+			conf.response[hButton[btn]] = or
 		}
 	}
 	// Prayers
@@ -406,16 +454,16 @@ func updateConfig(conf *config, fileName string) {
 		if i != 0 && col != nil {
 			pr := new(prayer)
 			input, _ := strconv.Atoi(col[1])
-			button, _ := strconv.Atoi(col[2])
+			btn, _ := strconv.Atoi(col[2])
 			pr.input = input
-			pr.button = button
+			pr.button = btn
 			pr.tb1Name = col[3]
 			pr.text1 = col[4]
 			if len(col) > 5 && col[5] != "----" {
 				pr.tb2Name = col[5]
 				pr.text2 = col[6]
 			}
-			conf.prayer[button] = pr
+			conf.prayer[btn] = pr
 		}
 	}
 
@@ -503,7 +551,7 @@ func SendMessage(client *vmixClient, message string) error {
 	if err == nil {
 		err = client.w.Flush()
 	}
-
+	debug("Sent message to API:", message)
 	return err
 }
 
@@ -527,7 +575,7 @@ func getMessage(client *vmixClient) {
 
 		if err == nil {
 			client.messageChan <- line
-			debug(line)
+			debug("Received from API:", line)
 		} else {
 			client.wg.Done()
 			fmt.Println("Error in GetMessage.ReadString: ", err)
@@ -546,6 +594,7 @@ func processVmixMessage(client *vmixClient, midiOutChan chan apcLEDS, vmixState 
 		var state int
 
 		if messageSlice[0] == "ACTS" && messageSlice[1] == "OK" {
+			debug("Processing message:", vmixMessage)
 			processActivator(vmixMessage, midiOutChan, conf)
 			parameter := messageSlice[2]
 
@@ -661,6 +710,7 @@ func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config)
 					iButtons := make([]int, len(buttons))
 					for i, s := range buttons {
 						iButtons[i], _ = strconv.Atoi(s)
+
 					}
 
 					leds := apcLEDS{
@@ -681,6 +731,7 @@ func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config)
 				iButtons := make([]int, len(buttons))
 				for i, s := range buttons {
 					iButtons[i], _ = strconv.Atoi(s)
+
 				}
 
 				leds := apcLEDS{
@@ -700,17 +751,22 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, client *vmixC
 	// type 176 is a control change
 	for {
 		msg := <-midiInChan
-		button := int(msg[1])
+		button := hButton[int(msg[1])]
 		var message []string
 
 		switch msg[0] {
 		case 144:
 			if msg[2] == 127 {
 				// button pressed
-				debug("Button Down:", msg[1])
+				debug("Button Down:", msg[1], button)
 				//Check overlayResponses to see if we have a match
 				if _, ok := conf.response[button]; ok {
 					execTextOverlay(client, button, conf)
+					midiOutChan <- apcLEDS{
+						buttons: []int{button},
+						color:   "red",
+					}
+
 				}
 
 				if _, ok := conf.prayer[button]; ok {
@@ -719,7 +775,7 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, client *vmixC
 
 				if _, ok := conf.shortcut[button]; ok {
 					for _, action := range conf.shortcut[button].actionsPressed {
-
+						debug("Performing action:", action)
 						if action == "dumpVars" {
 							spew.Dump("vmixState", vmixState)
 							spew.Dump("Config", conf)
@@ -732,11 +788,11 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, client *vmixC
 							for i, s := range leds {
 								iLeds[i], _ = strconv.Atoi(s)
 							}
-							apc := apcLEDS{
+							midiOutChan <- apcLEDS{
 								buttons: iLeds,
 								color:   color,
 							}
-							midiOutChan <- apc
+
 						} else {
 							m := "FUNCTION " + action
 							message = append(message, m)
@@ -746,14 +802,20 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, client *vmixC
 			}
 			if msg[2] == 0 {
 				//button released
-				debug("Button Up:", msg[1])
+				debug("Button Up:", msg[1], button)
 				//Check respConfig to see if we have a match. If so remove the overlay
 				if _, ok := conf.response[button]; ok {
 					message = append(message, "FUNCTION OverlayInput1Out")
+					midiOutChan <- apcLEDS{
+						buttons: []int{button},
+						color:   "off",
+					}
+
 				}
 
 				if _, ok := conf.shortcut[button]; ok {
 					for _, action := range conf.shortcut[button].actionsReleased {
+						debug("Shortcut action to be taken:", action)
 						if action != "" {
 							if strings.HasPrefix(action, "leds") {
 								// ex: leds green 1,2,3
@@ -764,11 +826,11 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, client *vmixC
 								for i, s := range leds {
 									iLeds[i], _ = strconv.Atoi(s)
 								}
-								apc := apcLEDS{
+								midiOutChan <- apcLEDS{
 									buttons: iLeds,
 									color:   color,
 								}
-								midiOutChan <- apc
+
 							} else {
 								m := "FUNCTION " + action + "\r\n"
 								message = append(message, m)
@@ -780,7 +842,7 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, client *vmixC
 
 		case 176:
 			// Fader moved
-			fader := int(msg[1])
+			fader := oFader[int(msg[1])]
 
 			if _, ok := conf.fader[fader]; ok {
 				input := conf.fader[fader].input
@@ -812,6 +874,7 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, client *vmixC
 
 		if message != nil {
 			for _, mess := range message {
+				debug("Sending message:", mess)
 				_ = SendMessage(client, mess)
 			}
 		}
@@ -864,8 +927,8 @@ func execPrayerOverlay(client *vmixClient, button int, vmixState state, conf con
 
 func setAllLed(color string, midiOutChan chan apcLEDS) {
 
-	min := 0
-	max := 71
+	min := 1
+	max := 63
 	a := make([]int, max-min+1)
 	for i := range a {
 		a[i] = min + i
@@ -877,7 +940,7 @@ func setAllLed(color string, midiOutChan chan apcLEDS) {
 	}
 	midiOutChan <- leds
 
-	min = 82
+	/*min = 82
 	max = 89
 	a = make([]int, max-min+1)
 	for i := range a {
@@ -888,7 +951,7 @@ func setAllLed(color string, midiOutChan chan apcLEDS) {
 		buttons: a,
 		color:   color,
 	}
-	midiOutChan <- leds
+	midiOutChan <- leds*/
 }
 
 func getMIDIPorts() (midiPort midiPorts) {
@@ -947,10 +1010,6 @@ func getMIDIPorts() (midiPort midiPorts) {
 	}
 }
 
-func printPort(port midi.Port) {
-	fmt.Printf("[%v] %s\n", port.Number(), port.String())
-}
-
 func initMidi(midiInChan chan []byte, midiOutChan chan apcLEDS) {
 	var midiPort = new(midiPorts)
 
@@ -993,11 +1052,12 @@ func setAPCLED(led apcLEDS, outPort *midi.Out) {
 	wr.ConsolidateNotes(false)
 
 	for _, button := range led.buttons {
-		b := uint8(button)
+		b := oButton[button]
+		debug("LED request.  orig button:", button, "trans button:", b, " Color:", led.color)
 		if led.color == "off" {
-			_ = writer.NoteOff(wr, b)
+			_ = writer.NoteOff(wr, uint8(b))
 		} else {
-			_ = writer.NoteOn(wr, b, values[led.color])
+			_ = writer.NoteOn(wr, uint8(b), values[led.color])
 		}
 	}
 }
