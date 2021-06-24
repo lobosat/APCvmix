@@ -53,17 +53,14 @@ type shortcut struct {
 }
 
 type prayer struct {
-	button  int
-	input   int
-	tb1Name string
-	text1   string
-	tb2Name string
-	text2   string
+	button int
+	input  string
+	verses []string
 }
 
 type activator struct {
 	trigger   string
-	input     int
+	input     string
 	onAction  []string
 	offAction []string
 }
@@ -73,12 +70,27 @@ type fader struct {
 	input string
 }
 
+type hymn struct {
+	button int
+	input  int
+	title  string
+	verses []string
+}
+
+type verses struct {
+	input      string
+	verses     []string
+	verseIndex int
+}
+
 type config struct {
 	fader     map[int]*fader
-	activator map[string]*map[int]activator
+	activator map[string]*map[string]activator
 	prayer    map[int]*prayer
 	shortcut  map[int]*shortcut
 	response  map[int]*response
+	hymn      map[int]*hymn
+	initial   map[int]string
 }
 
 type state struct {
@@ -107,6 +119,8 @@ type apcLEDS struct {
 	buttons []int
 	color   string
 }
+
+var currentVerses = new(verses)
 
 // Translate from the APC midi mapping (0 is left button on last row
 // to more logical numbering where 1 is the top-left button
@@ -171,6 +185,64 @@ func newState() state {
 	return *vmixState
 }
 
+//setInitialState will set the LEDs on the APC mini to their initial (default) state
+func setInitialState(conf config, midiOutChan chan apcLEDS, vmixState state) {
+	initState := conf.initial
+	var redLeds apcLEDS
+	var yellowLeds apcLEDS
+	var greenLeds apcLEDS
+
+	setAllLed("off", midiOutChan)
+	time.Sleep(time.Second)
+
+	redLeds.color = "red"
+	yellowLeds.color = "yellow"
+	greenLeds.color = "green"
+
+	for button, color := range initState {
+		if color == "red" {
+			redLeds.buttons = append(redLeds.buttons, button)
+		}
+
+		if color == "yellow" {
+			yellowLeds.buttons = append(yellowLeds.buttons, button)
+		}
+
+		if color == "green" {
+			greenLeds.buttons = append(greenLeds.buttons, button)
+		}
+	}
+
+	midiOutChan <- redLeds
+	midiOutChan <- yellowLeds
+	midiOutChan <- greenLeds
+
+	//Process activators based on current vmixState
+	// Process current vmixState map to set LEDs on board with current state
+	var vmixMessage string
+	var inputS string
+
+	// Active input
+	inputS = strconv.Itoa(vmixState.Input)
+	vmixMessage = "ACTS OK Input " + inputS + " 1"
+	processActivator(vmixMessage, midiOutChan, conf)
+
+	//Input has BusB assigned
+	for input, active := range vmixState.InputBusBAudio {
+
+		if active == true {
+			inputS = strconv.Itoa(input)
+			vmixMessage = "ACTS OK InputBusBAudio " + inputS + " 1"
+			processActivator(vmixMessage, midiOutChan, conf)
+		}
+		if active == false {
+			inputS = strconv.Itoa(input)
+			vmixMessage = "ACTS OK InputBusBAudio " + inputS + " 0"
+			processActivator(vmixMessage, midiOutChan, conf)
+		}
+	}
+}
+
 // updateVmixState will create a connection to the vMix API and query it to update the
 // vMix state variables with the current configuration
 func updateVmixState(vc vcConfig) state {
@@ -225,6 +297,7 @@ func updateVmixState(vc vcConfig) state {
 		state := inputs.SelectAttrValue("state", "")
 
 		if busses != "" {
+
 			if strings.Contains(busses, "A") {
 				//vmixStateMultiple["InputBusAAudio"] = map[string]bool{number: true}
 				vmixState.InputBusAAudio[number] = true
@@ -269,29 +342,42 @@ func updateVmixState(vc vcConfig) state {
 
 // newConfig initializes the configuration variable and loads it with the content of the configuration
 // spreadsheet.  It returns the new configuration variable
-func newConfig() config {
+func newConfig(filename string) config {
 
 	var scConfig = make(map[int]*shortcut)
 	var respConfig = make(map[int]*response)
 	var prayerConfig = make(map[int]*prayer)
-	var activatorConfig = make(map[string]*map[int]activator)
+	var activatorConfig = make(map[string]*map[string]activator)
 	var faderConfig = make(map[int]*fader)
+	var initialConfig = make(map[int]string)
 	conf := config{
 		fader:     faderConfig,
 		activator: activatorConfig,
 		prayer:    prayerConfig,
 		shortcut:  scConfig,
 		response:  respConfig,
+		initial:   initialConfig,
 	}
 
-	wb, err := excelize.OpenFile("responses.xlsx")
+	wb, err := excelize.OpenFile(filename)
 	if err != nil {
 		fmt.Println("Error opening workbook:", err)
 		return conf
 	}
+	//Initial configuration of LED colors on APC mini
+	inRows, _ := wb.GetRows("Initial State")
+	for idx, row := range inRows {
+		if idx != 0 && len(row) > 1 {
+			if len(row[1]) > 0 {
+				btn, _ := strconv.Atoi(row[0])
+				initialConfig[btn] = row[1]
+			}
+		}
+	}
 
 	//Shortcuts
 	scRows, _ := wb.GetRows("Shortcuts")
+
 	for idx, row := range scRows {
 		if idx != 0 && len(row) > 1 {
 			btn, _ := strconv.Atoi(row[0])
@@ -321,21 +407,18 @@ func newConfig() config {
 	}
 	// Prayers
 	prayerCols, _ := wb.GetCols("Prayers")
-	for i, col := range prayerCols {
-		if i != 0 && col != nil {
-			pr := new(prayer)
-			input, _ := strconv.Atoi(col[1])
-			btn, _ := strconv.Atoi(col[2])
-			pr.input = input
-			pr.button = btn
-			pr.tb1Name = col[3]
-			pr.text1 = col[4]
-			if len(col) > 5 && col[5] != "----" {
-				pr.tb2Name = col[5]
-				pr.text2 = col[6]
-			}
-			conf.prayer[btn] = pr
-		}
+	for _, col := range prayerCols {
+		var pr = new(prayer)
+
+		input := col[1]
+		btn, _ := strconv.Atoi(col[2])
+		pr.input = input
+		pr.button = btn
+
+		//verses start at col[3].  Get a sub slice
+		verses := col[3:]
+		pr.verses = verses
+		conf.prayer[btn] = pr
 	}
 
 	//Activators
@@ -343,18 +426,18 @@ func newConfig() config {
 	activatorCols, _ := wb.GetCols("Activators")
 
 	for i, col := range activatorCols {
-		if i > 0 && col != nil {
+		if i > 0 && len(col) > 0 {
 			var onActions []string
 			var offActions []string
 			var trigger string
-			var input int
+			var input string
 
 			//read the column in chunks of 3 lines, create a vmixActivatorConsole with the info, and
 			//add to the inputMap for that trigger
 			trigger = col[0]
-			inputs := make(map[int]activator)
+			inputs := make(map[string]activator)
 			for i := 1; col[i] != ""; i = i + 3 {
-				input, _ = strconv.Atoi(col[i])
+				input = col[i]
 				onActions = strings.Split(col[i+1], "\n")
 				offActions = strings.Split(col[i+2], "\n")
 				vmc := new(activator)
@@ -419,6 +502,17 @@ func updateConfig(conf *config, fileName string) {
 		fmt.Println("Error opening workbook:", err)
 	}
 
+	//Initial configuration of LED colors on APC mini
+	inRows, _ := wb.GetRows("Initial State")
+	for idx, row := range inRows {
+		if idx != 0 && len(row) > 1 {
+			if len(row[1]) > 0 {
+				btn, _ := strconv.Atoi(row[0])
+				conf.initial[btn] = row[1]
+			}
+		}
+	}
+
 	//Shortcuts
 	scRows, _ := wb.GetRows("Shortcuts")
 	for idx, row := range scRows {
@@ -452,17 +546,19 @@ func updateConfig(conf *config, fileName string) {
 	prayerCols, _ := wb.GetCols("Prayers")
 	for i, col := range prayerCols {
 		if i != 0 && col != nil {
-			pr := new(prayer)
-			input, _ := strconv.Atoi(col[1])
+			var pr = new(prayer)
+			var verses []string
+
+			i := 3
+			for len(strings.TrimSpace(col[i])) > 0 {
+				verses = append(verses, col[i])
+				i++
+			}
+
+			input := col[1]
 			btn, _ := strconv.Atoi(col[2])
 			pr.input = input
 			pr.button = btn
-			pr.tb1Name = col[3]
-			pr.text1 = col[4]
-			if len(col) > 5 && col[5] != "----" {
-				pr.tb2Name = col[5]
-				pr.text2 = col[6]
-			}
 			conf.prayer[btn] = pr
 		}
 	}
@@ -475,12 +571,12 @@ func updateConfig(conf *config, fileName string) {
 			var onActions []string
 			var offActions []string
 			var trigger string
-			var input int
+			var input string
 
 			trigger = col[0]
-			inputs := make(map[int]activator)
+			inputs := make(map[string]activator)
 			for i := 1; col[i] != ""; i = i + 3 {
-				input, _ = strconv.Atoi(col[i])
+				input = col[i]
 				onActions = strings.Split(col[i+1], "\n")
 				offActions = strings.Split(col[i+2], "\n")
 				vmc := new(activator)
@@ -505,6 +601,7 @@ func updateConfig(conf *config, fileName string) {
 		fc.input = input
 		conf.fader[faderNum] = fc
 	}
+
 }
 
 // vmixAPIConnect connects to the vMix API. apiAddress is a string
@@ -557,7 +654,7 @@ func SendMessage(client *vmixClient, message string) error {
 
 // getMessage connects to the vMix API and issues a subscription to activators.
 // It then remains listening for any messages from the API server.  Any messages
-// received are sent to the vmixMessageChan channel for consumption.  This is a blocking
+// received are sent to the messageChan channel for consumption.  This is a blocking
 // function.  The vmixClient must already be connected to the API and available as a global object.
 func getMessage(client *vmixClient) {
 
@@ -587,6 +684,7 @@ func getMessage(client *vmixClient) {
 // It uses these messages to update the vMix State maps which are used for the
 // conditional actions. This is a blocking function.
 func processVmixMessage(client *vmixClient, midiOutChan chan apcLEDS, vmixState state, conf config) {
+
 	for {
 		vmixMessage := <-client.messageChan
 		messageSlice := strings.Fields(vmixMessage)
@@ -675,26 +773,25 @@ func processVmixMessage(client *vmixClient, midiOutChan chan apcLEDS, vmixState 
 				}
 			}
 		}
-
 	}
 }
 
 func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config) {
-
+	debug("Processing activator for vmix message: ", vmixMessage)
 	messageSlice := strings.Fields(vmixMessage)
 	trigger := messageSlice[2]
 	var state string
-	var input int
+	var input string
 	var actions []string
 
 	if len(messageSlice) == 5 {
 		state = messageSlice[4]
-		input, _ = strconv.Atoi(messageSlice[3])
+		input = messageSlice[3]
 	}
 
 	if len(messageSlice) == 4 {
 		state = messageSlice[3]
-		input = 0
+		input = "none"
 	}
 
 	if _, ok := conf.activator[trigger]; ok { //do we have an activator config for this trigger?
@@ -703,10 +800,10 @@ func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config)
 			if state == "0" {
 				actions = v[input].offAction
 				for _, action := range actions {
-					debug(action)
 					act := strings.Split(action, ": ")
 					color := act[0]
 					buttons := strings.Split(act[1], ",")
+
 					iButtons := make([]int, len(buttons))
 					for i, s := range buttons {
 						iButtons[i], _ = strconv.Atoi(s)
@@ -717,6 +814,7 @@ func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config)
 						buttons: iButtons,
 						color:   color,
 					}
+					spew.Dump(leds)
 					midiOutChan <- leds
 				}
 			}
@@ -744,11 +842,12 @@ func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config)
 	}
 }
 
-func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, client *vmixClient, vmixState state, conf config) {
+func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan chan verses, client *vmixClient, vmixState state, conf config) {
 	// message is a byte [type button velocity]
 	// type 144, velocity 0 is a button up
 	// type 144, velocity 127 is a button down
 	// type 176 is a control change
+
 	for {
 		msg := <-midiInChan
 		button := hButton[int(msg[1])]
@@ -759,7 +858,36 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, client *vmixC
 			if msg[2] == 127 {
 				// button pressed
 				debug("Button Down:", msg[1], button)
-				//Check overlayResponses to see if we have a match
+
+				if button == 55 {
+					debug("Next button invoked")
+					if currentVerses.input != "" {
+						currentVerses.verseIndex++
+						debug("verseIndex:", currentVerses.verseIndex, "Length", len(currentVerses.verses))
+						if currentVerses.verseIndex < len(currentVerses.verses) {
+							verseChan <- *currentVerses
+						}
+					}
+				}
+
+				if button == 54 {
+					debug("Prev button invoked")
+					if currentVerses.input != "" {
+						currentVerses.verseIndex--
+						debug("verseIndex:", currentVerses.verseIndex, "Length", len(currentVerses.verses))
+						if currentVerses.verseIndex >= 0 {
+							verseChan <- *currentVerses
+						}
+					}
+				}
+
+				if button == 56 {
+					debug("OvOff button invoked")
+					m := "FUNCTION OverlayInput1Out Input=" + currentVerses.input
+					*currentVerses = verses{"", []string{}, 0}
+					message = append(message, m)
+				}
+
 				if _, ok := conf.response[button]; ok {
 					execTextOverlay(client, button, conf)
 					midiOutChan <- apcLEDS{
@@ -769,11 +897,14 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, client *vmixC
 
 				}
 
-				if _, ok := conf.prayer[button]; ok {
-					execPrayerOverlay(client, button, vmixState, conf)
+				if item, ok := conf.prayer[button]; ok {
+					//execPrayerOverlay(client, button, vmixState, conf, verseChan)
+					*currentVerses = verses{item.input, item.verses, 0}
+					verseChan <- *currentVerses
 				}
 
 				if _, ok := conf.shortcut[button]; ok {
+
 					for _, action := range conf.shortcut[button].actionsPressed {
 						debug("Performing action:", action)
 						if action == "dumpVars" {
@@ -898,30 +1029,19 @@ func execTextOverlay(client *vmixClient, button int, conf config) {
 	}
 }
 
-func execPrayerOverlay(client *vmixClient, button int, vmixState state, conf config) {
+func versePager(verseChan chan verses, client *vmixClient) {
 	var message string
+	for {
+		debug("starting versePager")
+		item := <-verseChan
+		debug("versePager received item:", item)
 
-	if item, ok := conf.prayer[button]; ok {
-		input := strconv.Itoa(item.input)
-
-		if vmixState.Overlay1 == item.input {
-			//Overlay is already displayed, remove it
-			message = "FUNCTION OverlayInput1Out"
-		} else {
-			// Display the overlay
-			message = "FUNCTION SetText Input=" + input + "&SelectedName=" + url.QueryEscape(item.tb1Name) +
-				"&Value=" + url.QueryEscape(item.text1)
-			_ = SendMessage(client, message)
-			if item.tb2Name != "" {
-				message = "FUNCTION SetText Input=" + input + "&SelectedName=" + url.QueryEscape(item.tb2Name) +
-					"&Value=" + url.QueryEscape(item.text2)
-				_ = SendMessage(client, message)
-			}
-			d, _ := time.ParseDuration("100ms")
-			time.Sleep(d)
-			message = "FUNCTION OverlayInput1In Input=" + input
-			_ = SendMessage(client, message)
-		}
+		message = "FUNCTION SetText Input=" + item.input + "&SelectedName=TextBlock1.Text&Value=" +
+			url.QueryEscape(item.verses[currentVerses.verseIndex])
+		_ = SendMessage(client, message)
+		time.Sleep(time.Millisecond * 300)
+		message = "FUNCTION OverlayInput1In Input=" + item.input
+		_ = SendMessage(client, message)
 	}
 }
 
@@ -939,19 +1059,6 @@ func setAllLed(color string, midiOutChan chan apcLEDS) {
 		color:   color,
 	}
 	midiOutChan <- leds
-
-	/*min = 82
-	max = 89
-	a = make([]int, max-min+1)
-	for i := range a {
-		a[i] = min + i
-	}
-
-	leds = apcLEDS{
-		buttons: a,
-		color:   color,
-	}
-	midiOutChan <- leds*/
 }
 
 func getMIDIPorts() (midiPort midiPorts) {
@@ -1027,7 +1134,6 @@ func initMidi(midiInChan chan []byte, midiOutChan chan apcLEDS) {
 	err := rd.ListenTo(*midiPort.in)
 	if err != nil {
 		fmt.Println(err)
-		//client.wg.Done()
 		return
 	}
 
@@ -1038,6 +1144,7 @@ func initMidi(midiInChan chan []byte, midiOutChan chan apcLEDS) {
 }
 
 func setAPCLED(led apcLEDS, outPort *midi.Out) {
+
 	values := map[string]uint8{
 		"green":       1,
 		"greenBlink":  2,
@@ -1053,7 +1160,6 @@ func setAPCLED(led apcLEDS, outPort *midi.Out) {
 
 	for _, button := range led.buttons {
 		b := oButton[button]
-		debug("LED request.  orig button:", button, "trans button:", b, " Color:", led.color)
 		if led.color == "off" {
 			_ = writer.NoteOff(wr, uint8(b))
 		} else {
@@ -1064,13 +1170,14 @@ func setAPCLED(led apcLEDS, outPort *midi.Out) {
 
 func main() {
 	const (
-		apiAddress = "127.0.0.1:8099"   // address and port for the vMix TCP API
-		fileName   = "./responses.xlsx" // path and filename to the configuration spreadsheet
+		apiAddress = "127.0.0.1:8099"  // address and port for the vMix TCP API
+		fileName   = "Livestream.xlsx" // path and filename to the configuration spreadsheet
 	)
 
 	var midiInChan = make(chan []byte, 10)
 	var midiOutChan = make(chan apcLEDS, 10)
 	var messageChan = make(chan string)
+	var verseChan = make(chan verses)
 	var wg sync.WaitGroup
 
 	vcConf := vcConfig{
@@ -1079,19 +1186,19 @@ func main() {
 		wg:          &wg,
 	}
 
+	config := newConfig(fileName)
+	vmixState := updateVmixState(vcConf)
+	setInitialState(config, midiOutChan, vmixState)
 	vmClient, _ := vmixAPIConnect(vcConf)
 
-	vmixState := updateVmixState(vcConf)
-	config := newConfig()
 	go watchConfigFile(&config, fileName)
-
-	setAllLed("off", midiOutChan)
 
 	go getMessage(vmClient)
 	go processVmixMessage(vmClient, midiOutChan, vmixState, config)
 
 	go initMidi(midiInChan, midiOutChan)
-	go processMidi(midiInChan, midiOutChan, vmClient, vmixState, config)
+	go processMidi(midiInChan, midiOutChan, verseChan, vmClient, vmixState, config)
+	go versePager(verseChan, vmClient)
 
 	defer vmClient.conn.Close()
 	defer close(vmClient.messageChan)
