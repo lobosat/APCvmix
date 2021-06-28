@@ -116,7 +116,7 @@ type state struct {
 	InputMasterAudio map[int]bool
 	InputBusAAudio   map[int]bool
 	InputBusBAudio   map[int]bool
-	nameMap          map[string]int
+	nameMap          map[string]string
 }
 
 type midiPorts struct {
@@ -192,7 +192,7 @@ func newState() state {
 	vmixState.InputBusBAudio = make(map[int]bool)
 	vmixState.InputMasterAudio = make(map[int]bool)
 	vmixState.InputPlaying = make(map[int]bool)
-	vmixState.nameMap = make(map[string]int)
+	vmixState.nameMap = make(map[string]string)
 	return *vmixState
 }
 
@@ -236,7 +236,7 @@ func setInitialState(conf config, midiOutChan chan apcLEDS, vmixState state) {
 	// Active input
 	inputS = strconv.Itoa(vmixState.Input)
 	vmixMessage = "ACTS OK Input " + inputS + " 1"
-	processActivator(vmixMessage, midiOutChan, conf, vmixState)
+	processActivator(vmixMessage, midiOutChan, conf)
 
 	//Input has BusB assigned
 	for input, active := range vmixState.InputBusBAudio {
@@ -244,12 +244,12 @@ func setInitialState(conf config, midiOutChan chan apcLEDS, vmixState state) {
 		if active == true {
 			inputS = strconv.Itoa(input)
 			vmixMessage = "ACTS OK InputBusBAudio " + inputS + " 1"
-			processActivator(vmixMessage, midiOutChan, conf, vmixState)
+			processActivator(vmixMessage, midiOutChan, conf)
 		}
 		if active == false {
 			inputS = strconv.Itoa(input)
 			vmixMessage = "ACTS OK InputBusBAudio " + inputS + " 0"
-			processActivator(vmixMessage, midiOutChan, conf, vmixState)
+			processActivator(vmixMessage, midiOutChan, conf)
 		}
 	}
 }
@@ -302,11 +302,15 @@ func updateVmixState(vc vcConfig) state {
 	}
 
 	for _, inputs := range doc.FindElements("./vmix/inputs/*") {
+
 		busses := inputs.SelectAttrValue("audiobusses", "")
 		number, _ := strconv.Atoi(inputs.SelectAttrValue("number", ""))
+		input := inputs.SelectAttrValue("number", "")
 		inputType := inputs.SelectAttrValue("type", "")
 		state := inputs.SelectAttrValue("state", "")
 		name := inputs.SelectAttrValue("title", "")
+
+		vmixState.nameMap[name] = input
 
 		if busses != "" {
 
@@ -329,7 +333,6 @@ func updateVmixState(vc vcConfig) state {
 			vmixState.InputPlaying[number] = true
 		}
 
-		vmixState.nameMap[name] = number
 	}
 
 	streaming := doc.FindElement("/vmix/streaming").Text()
@@ -350,12 +353,13 @@ func updateVmixState(vc vcConfig) state {
 
 	preview := doc.FindElement("/vmix/preview").Text()
 	vmixState.InputPreview, _ = strconv.Atoi(preview)
+
 	return vmixState
 }
 
 // newConfig initializes the configuration variable and loads it with the content of the configuration
 // spreadsheet.  It returns the new configuration variable
-func newConfig(filename string) config {
+func newConfig(filename string, vmixState state) config {
 
 	var scConfig = make(map[int]*shortcut)
 	var respConfig = make(map[int]*response)
@@ -494,6 +498,13 @@ func newConfig(filename string) config {
 			inputs := make(map[string]activator)
 			for i := 1; col[i] != ""; i = i + 3 {
 				input = col[i]
+
+				// If the input is provided in the spreadsheet as a name we will need to get it's
+				// input number, since the Activator Subscription in the API only returns numbers
+				if inputNum, ok := vmixState.nameMap[input]; ok {
+					input = inputNum
+
+				}
 				onActions = strings.Split(col[i+1], "\n")
 				offActions = strings.Split(col[i+2], "\n")
 				vmc := new(activator)
@@ -537,7 +548,7 @@ func newConfig(filename string) config {
 
 // watchConfigFile watches the configuration spreadsheet (responses.xlsx) for any changes (write).
 // If any changes are detected it will reload the conf variable with the new data.
-func watchConfigFile(conf *config, fileName string) {
+func watchConfigFile(conf *config, fileName string, vmixState state) {
 	w := watcher.New()
 
 	go func() {
@@ -545,7 +556,7 @@ func watchConfigFile(conf *config, fileName string) {
 			select {
 			case event := <-w.Event:
 				if event.Op.String() == "WRITE" {
-					updateConfig(conf, fileName)
+					updateConfig(conf, fileName, vmixState)
 				}
 			case err := <-w.Error:
 				log.Fatalln(err)
@@ -566,7 +577,7 @@ func watchConfigFile(conf *config, fileName string) {
 
 // updateConfig will update the current config variable by re-reading the configuration spreadsheet.  It is
 // intended to be called by a file watcher whenever the configuration sheet is changed.
-func updateConfig(conf *config, fileName string) {
+func updateConfig(conf *config, fileName string, vmixState state) {
 	wb, err := excelize.OpenFile(fileName)
 	if err != nil {
 		fmt.Println("Error opening workbook:", err)
@@ -646,6 +657,11 @@ func updateConfig(conf *config, fileName string) {
 			inputs := make(map[string]activator)
 			for i := 1; col[i] != ""; i = i + 3 {
 				input = col[i]
+				// If the input is provided in the spreadsheet as a name we will need to get it's
+				// input number, since the Activator Subscription in the API only returns numbers
+				if inputNum, ok := vmixState.nameMap[input]; ok {
+					input = inputNum
+				}
 				onActions = strings.Split(col[i+1], "\n")
 				offActions = strings.Split(col[i+2], "\n")
 				vmc := new(activator)
@@ -762,7 +778,7 @@ func processVmixMessage(client *vmixClient, midiOutChan chan apcLEDS, vmixState 
 
 		if messageSlice[0] == "ACTS" && messageSlice[1] == "OK" {
 			debug("Processing message:", vmixMessage)
-			processActivator(vmixMessage, midiOutChan, conf, vmixState)
+			processActivator(vmixMessage, midiOutChan, conf)
 			parameter := messageSlice[2]
 
 			if len(messageSlice) == 4 {
@@ -845,7 +861,7 @@ func processVmixMessage(client *vmixClient, midiOutChan chan apcLEDS, vmixState 
 	}
 }
 
-func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config, vmixState state) {
+func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config) {
 
 	messageSlice := strings.Fields(vmixMessage)
 	trigger := messageSlice[2]
@@ -863,11 +879,8 @@ func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config,
 		input = "none"
 	}
 
-	if inputNum, ok := vmixState.nameMap[input]; ok {
-		input = strconv.Itoa(inputNum)
-	}
-
 	if _, ok := conf.activator[trigger]; ok { //do we have an activator config for this trigger?
+		debug("Processing activator for input", input)
 		v := *conf.activator[trigger]
 		if _, ok := v[input]; ok { //do we have an activator config for this trigger and input?
 			if state == "0" {
@@ -880,9 +893,7 @@ func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config,
 					iButtons := make([]int, len(buttons))
 					for i, s := range buttons {
 						iButtons[i], _ = strconv.Atoi(s)
-
 					}
-
 					leds := apcLEDS{
 						buttons: iButtons,
 						color:   color,
@@ -1316,12 +1327,12 @@ func main() {
 		wg:          &wg,
 	}
 
-	config := newConfig(fileName)
 	vmixState := updateVmixState(vcConf)
+	config := newConfig(fileName, vmixState)
 	setInitialState(config, midiOutChan, vmixState)
 	vmClient, _ := vmixAPIConnect(vcConf)
 
-	go watchConfigFile(&config, fileName)
+	go watchConfigFile(&config, fileName, vmixState)
 
 	go getMessage(vmClient)
 	go processVmixMessage(vmClient, midiOutChan, vmixState, config)
