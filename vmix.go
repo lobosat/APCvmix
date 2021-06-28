@@ -41,7 +41,7 @@ type vcConfig struct {
 
 type response struct {
 	button   int
-	input    int
+	input    string
 	tbName   string
 	response string
 }
@@ -58,6 +58,25 @@ type prayer struct {
 	verses []string
 }
 
+type hymn struct {
+	button int
+	input  string
+	verses []string
+}
+
+type verses struct {
+	input      string
+	verses     []string
+	verseIndex int
+}
+
+type speaker struct {
+	button int
+	input  string
+	script string
+	name   string
+}
+
 type activator struct {
 	trigger   string
 	input     string
@@ -70,19 +89,6 @@ type fader struct {
 	input string
 }
 
-type hymn struct {
-	button int
-	input  int
-	title  string
-	verses []string
-}
-
-type verses struct {
-	input      string
-	verses     []string
-	verseIndex int
-}
-
 type config struct {
 	fader     map[int]*fader
 	activator map[string]*map[string]activator
@@ -90,7 +96,9 @@ type config struct {
 	shortcut  map[int]*shortcut
 	response  map[int]*response
 	hymn      map[int]*hymn
+	speaker   map[int]*speaker
 	initial   map[int]string
+	mics      map[string]string
 }
 
 type state struct {
@@ -108,6 +116,7 @@ type state struct {
 	InputMasterAudio map[int]bool
 	InputBusAAudio   map[int]bool
 	InputBusBAudio   map[int]bool
+	nameMap          map[string]int
 }
 
 type midiPorts struct {
@@ -129,7 +138,7 @@ var hButton = []int{
 	49, 50, 51, 52, 53, 54, 55, 56,
 	41, 42, 43, 44, 45, 46, 47, 48,
 	33, 34, 35, 36, 37, 38, 39, 40,
-	24, 26, 27, 28, 29, 30, 31, 32,
+	25, 26, 27, 28, 29, 30, 31, 32,
 	17, 18, 19, 20, 21, 22, 23, 24,
 	9, 10, 11, 12, 13, 14, 15, 16,
 	1, 2, 3, 4, 5, 6, 7, 8,
@@ -152,10 +161,11 @@ var oButton = []int{
 	16, 17, 18, 19, 20, 21, 22, 23,
 	8, 9, 10, 11, 12, 13, 14, 15,
 	0, 1, 2, 3, 4, 5, 6, 7,
-	65, 66, 67, 68, 69, 70, 71, 72,
-	73, 74, 75, 76, 77, 78, 79, 80,
+	//65, 66, 67, 68, 69, 70, 71, 72,
+	64, 65, 66, 67, 68, 69, 70, 71,
+	82, 83, 84, 85, 86, 87, 88, 89,
 	99, 99, 99, 99, 99, 99, 99, 99,
-	81,
+	98,
 }
 
 var oFader = map[int]int{
@@ -182,6 +192,7 @@ func newState() state {
 	vmixState.InputBusBAudio = make(map[int]bool)
 	vmixState.InputMasterAudio = make(map[int]bool)
 	vmixState.InputPlaying = make(map[int]bool)
+	vmixState.nameMap = make(map[string]int)
 	return *vmixState
 }
 
@@ -225,7 +236,7 @@ func setInitialState(conf config, midiOutChan chan apcLEDS, vmixState state) {
 	// Active input
 	inputS = strconv.Itoa(vmixState.Input)
 	vmixMessage = "ACTS OK Input " + inputS + " 1"
-	processActivator(vmixMessage, midiOutChan, conf)
+	processActivator(vmixMessage, midiOutChan, conf, vmixState)
 
 	//Input has BusB assigned
 	for input, active := range vmixState.InputBusBAudio {
@@ -233,12 +244,12 @@ func setInitialState(conf config, midiOutChan chan apcLEDS, vmixState state) {
 		if active == true {
 			inputS = strconv.Itoa(input)
 			vmixMessage = "ACTS OK InputBusBAudio " + inputS + " 1"
-			processActivator(vmixMessage, midiOutChan, conf)
+			processActivator(vmixMessage, midiOutChan, conf, vmixState)
 		}
 		if active == false {
 			inputS = strconv.Itoa(input)
 			vmixMessage = "ACTS OK InputBusBAudio " + inputS + " 0"
-			processActivator(vmixMessage, midiOutChan, conf)
+			processActivator(vmixMessage, midiOutChan, conf, vmixState)
 		}
 	}
 }
@@ -295,6 +306,7 @@ func updateVmixState(vc vcConfig) state {
 		number, _ := strconv.Atoi(inputs.SelectAttrValue("number", ""))
 		inputType := inputs.SelectAttrValue("type", "")
 		state := inputs.SelectAttrValue("state", "")
+		name := inputs.SelectAttrValue("title", "")
 
 		if busses != "" {
 
@@ -316,6 +328,8 @@ func updateVmixState(vc vcConfig) state {
 			//vmixStateMultiple["InputPlaying"] = map[string]bool{number: true}
 			vmixState.InputPlaying[number] = true
 		}
+
+		vmixState.nameMap[name] = number
 	}
 
 	streaming := doc.FindElement("/vmix/streaming").Text()
@@ -336,7 +350,6 @@ func updateVmixState(vc vcConfig) state {
 
 	preview := doc.FindElement("/vmix/preview").Text()
 	vmixState.InputPreview, _ = strconv.Atoi(preview)
-
 	return vmixState
 }
 
@@ -347,16 +360,23 @@ func newConfig(filename string) config {
 	var scConfig = make(map[int]*shortcut)
 	var respConfig = make(map[int]*response)
 	var prayerConfig = make(map[int]*prayer)
+	var hymnConfig = make(map[int]*hymn)
+	var speakerConfig = make(map[int]*speaker)
 	var activatorConfig = make(map[string]*map[string]activator)
 	var faderConfig = make(map[int]*fader)
 	var initialConfig = make(map[int]string)
+	var micsConfig = make(map[string]string)
+
 	conf := config{
 		fader:     faderConfig,
 		activator: activatorConfig,
 		prayer:    prayerConfig,
+		hymn:      hymnConfig,
+		speaker:   speakerConfig,
 		shortcut:  scConfig,
 		response:  respConfig,
 		initial:   initialConfig,
+		mics:      micsConfig,
 	}
 
 	wb, err := excelize.OpenFile(filename)
@@ -396,15 +416,15 @@ func newConfig(filename string) config {
 	for i, row := range respRows {
 		if i != 0 && len(row) > 1 {
 			btn, _ := strconv.Atoi(row[0])
-			input, _ := strconv.Atoi(row[1])
+
 			or := new(response)
 			or.button = btn
-			or.input = input
-			or.tbName = row[2]
-			or.response = row[3]
+			or.input = row[1]
+			or.response = row[2]
 			conf.response[btn] = or
 		}
 	}
+
 	// Prayers
 	prayerCols, _ := wb.GetCols("Prayers")
 	for _, col := range prayerCols {
@@ -419,6 +439,42 @@ func newConfig(filename string) config {
 		verses := col[3:]
 		pr.verses = verses
 		conf.prayer[btn] = pr
+	}
+
+	// Hymns
+	hymnCols, _ := wb.GetCols("Hymns")
+	for _, col := range hymnCols {
+		var hy = new(hymn)
+
+		input := col[1]
+		btn, _ := strconv.Atoi(col[2])
+		hy.input = input
+		hy.button = btn
+
+		//verses start at col[3].  Get a sub slice
+		verses := col[3:]
+		hy.verses = verses
+		conf.hymn[btn] = hy
+	}
+
+	// Speakers
+	spkRows, _ := wb.GetRows("Speakers")
+	for idx, row := range spkRows {
+		if idx > 0 && len(row) > 0 {
+			btn, _ := strconv.Atoi(row[1])
+			input := row[2]
+			script := row[3]
+			name := row[4]
+
+			sp := speaker{
+				button: btn,
+				input:  input,
+				script: script,
+				name:   name,
+			}
+
+			conf.speaker[btn] = &sp
+		}
 	}
 
 	//Activators
@@ -462,6 +518,20 @@ func newConfig(filename string) config {
 		fc.input = input
 		conf.fader[faderNum] = fc
 	}
+
+	//Microphone assignments
+	micCols, _ := wb.GetCols("microphones")
+
+	// col[3] is the name, col[4] is the input
+	names := micCols[3]
+	inputs := micCols[4]
+
+	for idx, name := range names {
+		if idx > 0 {
+			conf.mics[name] = inputs[idx]
+		}
+	}
+
 	return conf
 }
 
@@ -533,12 +603,11 @@ func updateConfig(conf *config, fileName string) {
 	for i, row := range respRows {
 		if i != 0 && row != nil {
 			btn, _ := strconv.Atoi(row[0])
-			input, _ := strconv.Atoi(row[1])
+
 			or := new(response)
 			or.button = hButton[btn]
-			or.input = input
-			or.tbName = row[2]
-			or.response = row[3]
+			or.input = row[1]
+			or.response = row[2]
 			conf.response[hButton[btn]] = or
 		}
 	}
@@ -550,7 +619,7 @@ func updateConfig(conf *config, fileName string) {
 			var verses []string
 
 			i := 3
-			for len(strings.TrimSpace(col[i])) > 0 {
+			for len(col[i]) > i {
 				verses = append(verses, col[i])
 				i++
 			}
@@ -693,7 +762,7 @@ func processVmixMessage(client *vmixClient, midiOutChan chan apcLEDS, vmixState 
 
 		if messageSlice[0] == "ACTS" && messageSlice[1] == "OK" {
 			debug("Processing message:", vmixMessage)
-			processActivator(vmixMessage, midiOutChan, conf)
+			processActivator(vmixMessage, midiOutChan, conf, vmixState)
 			parameter := messageSlice[2]
 
 			if len(messageSlice) == 4 {
@@ -776,8 +845,8 @@ func processVmixMessage(client *vmixClient, midiOutChan chan apcLEDS, vmixState 
 	}
 }
 
-func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config) {
-	debug("Processing activator for vmix message: ", vmixMessage)
+func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config, vmixState state) {
+
 	messageSlice := strings.Fields(vmixMessage)
 	trigger := messageSlice[2]
 	var state string
@@ -792,6 +861,10 @@ func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config)
 	if len(messageSlice) == 4 {
 		state = messageSlice[3]
 		input = "none"
+	}
+
+	if inputNum, ok := vmixState.nameMap[input]; ok {
+		input = strconv.Itoa(inputNum)
 	}
 
 	if _, ok := conf.activator[trigger]; ok { //do we have an activator config for this trigger?
@@ -814,7 +887,6 @@ func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config)
 						buttons: iButtons,
 						color:   color,
 					}
-					spew.Dump(leds)
 					midiOutChan <- leds
 				}
 			}
@@ -859,7 +931,7 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 				// button pressed
 				debug("Button Down:", msg[1], button)
 
-				if button == 55 {
+				if button == 55 || button == 26 {
 					debug("Next button invoked")
 					if currentVerses.input != "" {
 						currentVerses.verseIndex++
@@ -886,6 +958,8 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 					m := "FUNCTION OverlayInput1Out Input=" + currentVerses.input
 					*currentVerses = verses{"", []string{}, 0}
 					message = append(message, m)
+					// Turn off crowd mic
+					message = append(message, "FUNCTION AudioOff Input="+conf.mics["Crowd"])
 				}
 
 				if _, ok := conf.response[button]; ok {
@@ -894,13 +968,44 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 						buttons: []int{button},
 						color:   "red",
 					}
-
 				}
 
 				if item, ok := conf.prayer[button]; ok {
-					//execPrayerOverlay(client, button, vmixState, conf, verseChan)
 					*currentVerses = verses{item.input, item.verses, 0}
 					verseChan <- *currentVerses
+					//Turn on crowd mic
+					message = append(message, "FUNCTION AudioOn Input="+conf.mics["Crowd"])
+				}
+
+				if item, ok := conf.hymn[button]; ok {
+					*currentVerses = verses{item.input, item.verses, 0}
+					verseChan <- *currentVerses
+				}
+
+				if speaker, ok := conf.speaker[button]; ok {
+					var m string
+
+					name := speaker.name
+					script := speaker.script
+					input := speaker.input
+					textBox := "TextBlock1.Text"
+
+					if len(script) > 1 {
+						m = "FUNCTION ScriptStart Value=" +
+							url.QueryEscape(script)
+						_ = SendMessage(client, m)
+						//Give the script some time complete
+						time.Sleep(time.Millisecond * 500)
+					}
+
+					m = "FUNCTION SetText Input=" + input + "&SelectedName=" +
+						url.QueryEscape(textBox) +
+						"&Value=" + url.QueryEscape(name)
+					message = append(message, m)
+					time.Sleep(time.Millisecond * 1200)
+					m = "FUNCTION OverlayInput1In Input=" + input
+					message = append(message, m)
+
 				}
 
 				if _, ok := conf.shortcut[button]; ok {
@@ -934,37 +1039,55 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 			if msg[2] == 0 {
 				//button released
 				debug("Button Up:", msg[1], button)
-				//Check respConfig to see if we have a match. If so remove the overlay
+
+				//PoP remove response overlay
+				if button == 26 {
+					message = append(message, "FUNCTION OverlayInput1Out")
+				}
+
+				//Check respConfig to see if we have a match. If so remove the overlay and turn
+				//off the crowd mic
+
 				if _, ok := conf.response[button]; ok {
 					message = append(message, "FUNCTION OverlayInput1Out")
-					midiOutChan <- apcLEDS{
-						buttons: []int{button},
-						color:   "off",
-					}
+					message = append(message, "FUNCTION AudioOff Input="+conf.mics["Crowd"])
 
+					if button == 14 || button == 15 || button == 16 {
+						midiOutChan <- apcLEDS{
+							buttons: []int{button},
+							color:   "yellow",
+						}
+					} else {
+						midiOutChan <- apcLEDS{
+							buttons: []int{button},
+							color:   "off",
+						}
+					}
 				}
 
 				if _, ok := conf.shortcut[button]; ok {
 					for _, action := range conf.shortcut[button].actionsReleased {
-						debug("Shortcut action to be taken:", action)
 						if action != "" {
-							if strings.HasPrefix(action, "leds") {
-								// ex: leds green 1,2,3
-								parts := strings.Split(action, " ")
-								color := parts[1]
-								leds := strings.Split(parts[2], ",")
-								iLeds := make([]int, len(leds))
-								for i, s := range leds {
-									iLeds[i], _ = strconv.Atoi(s)
-								}
-								midiOutChan <- apcLEDS{
-									buttons: iLeds,
-									color:   color,
-								}
+							debug("Shortcut action to be taken:", action)
+							if action != "" {
+								if strings.HasPrefix(action, "leds") {
+									// ex: leds green 1,2,3
+									parts := strings.Split(action, " ")
+									color := parts[1]
+									leds := strings.Split(parts[2], ",")
+									iLeds := make([]int, len(leds))
+									for i, s := range leds {
+										iLeds[i], _ = strconv.Atoi(s)
+									}
+									midiOutChan <- apcLEDS{
+										buttons: iLeds,
+										color:   color,
+									}
 
-							} else {
-								m := "FUNCTION " + action + "\r\n"
-								message = append(message, m)
+								} else {
+									m := "FUNCTION " + action + "\r\n"
+									message = append(message, m)
+								}
 							}
 						}
 					}
@@ -1014,17 +1137,24 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 
 func execTextOverlay(client *vmixClient, button int, conf config) {
 	var message string
+	var tbName = "TextBlock1.Text"
 
 	if item, ok := conf.response[button]; ok {
-		input := strconv.Itoa(item.input)
+
 		//set the text
-		message = "FUNCTION SetText Input=" + input + "&SelectedName=" + url.QueryEscape(item.tbName) +
+		message = "FUNCTION SetText Input=" + item.input + "&SelectedName=" +
+			url.QueryEscape(tbName) +
 			"&Value=" + url.QueryEscape(item.response)
 		_ = SendMessage(client, message)
+
+		// Turn on the crowd mic
+		message = "FUNCTION AudioOn Input=" + conf.mics["Crowd"]
+		_ = SendMessage(client, message)
+
 		//pause for 100 milliseconds to allow text to update in the title
 		d, _ := time.ParseDuration("100ms")
 		time.Sleep(d)
-		message = "FUNCTION OverlayInput1In Input=" + input
+		message = "FUNCTION OverlayInput1In Input=" + item.input
 		_ = SendMessage(client, message)
 	}
 }
