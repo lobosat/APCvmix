@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"github.com/360EntSecGroup-Skylar/excelize/v2"
 	"github.com/beevik/etree"
@@ -402,6 +403,7 @@ func newConfig(filename string, vmixState state) config {
 		fmt.Println("Error opening workbook:", err)
 		return conf
 	}
+
 	//Initial configuration of LED colors on APC mini
 	inRows, _ := wb.GetRows("Initial State")
 	for idx, row := range inRows {
@@ -1169,6 +1171,10 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 					if strings.Contains(input, "Bus") {
 						m = "FUNCTION Set" + input + "Volume Value=" + volumeS
 					}
+					if input == "Dynamic1" {
+						input = "Dynamic1"
+						m = "FUNCTION SetVolume Input=" + input + "&Value=" + volumeS
+					}
 				}
 				if m != "" {
 					message = append(message, m)
@@ -1241,9 +1247,10 @@ func setAllLed(color string, midiOutChan chan apcLEDS) {
 	midiOutChan <- leds
 }
 
-func getMIDIPorts() (midiPort midiPorts) {
+func getMIDIPorts() (err error, midiPort midiPorts) {
 	var inPort midi.In
 	var outPort midi.Out
+
 	foundAPCIn := false
 	foundAPCOut := false
 
@@ -1290,17 +1297,21 @@ func getMIDIPorts() (midiPort midiPorts) {
 	if foundAPCIn && foundAPCOut {
 		midiPort.in = &inPort
 		midiPort.out = &outPort
-		return midiPort
+
+		return nil, midiPort
 	} else {
-		panic("No APC Mini found. Aborting")
-		return
+		return errors.New("unable to find an APC Mini"), midiPorts{}
 	}
 }
 
 func initMidi(midiInChan chan []byte, midiOutChan chan apcLEDS) {
 	var midiPort = new(midiPorts)
+	var err error
 
-	*midiPort = getMIDIPorts()
+	err, *midiPort = getMIDIPorts()
+	if err != nil {
+		panic(err)
+	}
 
 	rd := reader.New(
 		reader.NoLogger(),
@@ -1311,11 +1322,13 @@ func initMidi(midiInChan chan []byte, midiOutChan chan apcLEDS) {
 		}),
 	)
 
-	err := rd.ListenTo(*midiPort.in)
+	err = rd.ListenTo(*midiPort.in)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
+
+	go watchdog(midiPort, midiInChan, midiOutChan)
 
 	for {
 		apcLED := <-midiOutChan
@@ -1348,10 +1361,35 @@ func setAPCLED(led apcLEDS, outPort *midi.Out) {
 	}
 }
 
+func watchdog(midiPort *midiPorts, midiInChan chan []byte, midiOutChan chan apcLEDS) {
+	for {
+		wr := writer.New(*midiPort.out)
+		wr.ConsolidateNotes(false)
+		err := writer.NoteOff(wr, 100)
+		if err != nil {
+			// Attempt to re-connect to APC Mini
+			for err != nil {
+				debug("Attempting to re-connect to APC")
+				err, *midiPort = getMIDIPorts()
+				time.Sleep(time.Second * 2)
+			}
+			// Close current ports
+			in := *midiPort.in
+			out := *midiPort.out
+			in.Close()
+			out.Close()
+
+			go initMidi(midiInChan, midiOutChan)
+			return
+		}
+		time.Sleep(time.Second * 2)
+	}
+}
+
 func main() {
 	const (
-		apiAddress = "127.0.0.1:8099"  // address and port for the vMix TCP API
-		fileName   = "Livestream.xlsx" // path and filename to the configuration spreadsheet
+		apiAddress = "127.0.0.1:8099"                                                                        // address and port for the vMix TCP API
+		fileName   = "D:/OneDrive/Episcopal Church of Reconciliation/Livestream - Documents/Livestream.xlsx" // path and filename to the configuration spreadsheet
 	)
 
 	var midiInChan = make(chan []byte, 10)
@@ -1367,17 +1405,17 @@ func main() {
 	}
 
 	vmixState := updateVmixState(vcConf)
-	config := newConfig(fileName, vmixState)
-	setInitialState(config, midiOutChan, vmixState)
+	vmConfig := newConfig(fileName, vmixState)
+	setInitialState(vmConfig, midiOutChan, vmixState)
 	vmClient, _ := vmixAPIConnect(vcConf)
 
-	go watchConfigFile(&config, fileName, vmixState)
+	go watchConfigFile(&vmConfig, fileName, vmixState)
 
 	go getMessage(vmClient)
-	go processVmixMessage(vmClient, midiOutChan, vmixState, config)
+	go processVmixMessage(vmClient, midiOutChan, vmixState, vmConfig)
 
 	go initMidi(midiInChan, midiOutChan)
-	go processMidi(midiInChan, midiOutChan, verseChan, vmClient, config)
+	go processMidi(midiInChan, midiOutChan, verseChan, vmClient, vmConfig)
 	go versePager(verseChan, vmClient)
 
 	defer vmClient.conn.Close()
