@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"errors"
+	"flag"
 	"fmt"
 	"github.com/360EntSecGroup-Skylar/excelize/v2"
 	"github.com/beevik/etree"
@@ -22,8 +23,6 @@ import (
 	"sync"
 	"time"
 )
-
-const DEBUG = true
 
 type vmixClient struct {
 	conn        net.Conn
@@ -190,8 +189,10 @@ var oFader = map[int]int{
 	56: 9,
 }
 
+var DEBUG *bool
+
 func debug(msg ...interface{}) {
-	if DEBUG {
+	if *DEBUG {
 		fmt.Println(msg)
 	}
 }
@@ -215,9 +216,6 @@ func setInitialState(conf config, midiOutChan chan apcLEDS, vmixState state) {
 	var yellowLeds apcLEDS
 	var greenLeds apcLEDS
 
-	setAllLed("off", midiOutChan)
-	time.Sleep(time.Second)
-
 	redLeds.color = "red"
 	yellowLeds.color = "yellow"
 	greenLeds.color = "green"
@@ -231,9 +229,10 @@ func setInitialState(conf config, midiOutChan chan apcLEDS, vmixState state) {
 			yellowLeds.buttons = append(yellowLeds.buttons, button)
 		}
 
-		if color == "green" {
+		if color == "green" || color == "on" {
 			greenLeds.buttons = append(greenLeds.buttons, button)
 		}
+
 	}
 
 	midiOutChan <- redLeds
@@ -1235,19 +1234,16 @@ func versePager(verseChan chan verses, client *vmixClient) {
 }
 
 func setAllLed(color string, midiOutChan chan apcLEDS) {
+	var btn []int
 
-	min := 1
-	max := 63
-	a := make([]int, max-min+1)
-	for i := range a {
-		a[i] = min + i
+	for a := 1; a < 81; a++ {
+		btn = append(btn, a)
 	}
-
 	leds := apcLEDS{
-		buttons: a,
-		color:   color,
-	}
+		buttons: btn,
+		color:   color}
 	midiOutChan <- leds
+
 }
 
 func getMIDIPorts() (err error, midiPort midiPorts) {
@@ -1341,6 +1337,7 @@ func initMidi(midiInChan chan []byte, midiOutChan chan apcLEDS) {
 
 func setAPCLED(led apcLEDS, outPort *midi.Out) {
 
+	debug("Received apcLED", led)
 	values := map[string]uint8{
 		"green":       1,
 		"greenBlink":  2,
@@ -1412,31 +1409,35 @@ func killOthers() {
 
 func main() {
 
+	//Process any CLI args
+	DEBUG = flag.Bool("debug", false, "Display debugging info on stdout (true/false)")
+	apiAddress := flag.String("apiAddr", "127.0.0.1:8099", "IP address and port of vMix API (127.0.0.1:8099)")
+	fileName := flag.String("fileName", "D:/OneDrive/Episcopal Church of Reconciliation/Livestream - Documents/Livestream.xlsx",
+		"Path and filename to the vmixAPC configuration workbook")
+	flag.Parse()
+
 	killOthers()
 
-	const (
-		apiAddress = "127.0.0.1:8099"                                                                        // address and port for the vMix TCP API
-		fileName   = "D:/OneDrive/Episcopal Church of Reconciliation/Livestream - Documents/Livestream.xlsx" // path and filename to the configuration spreadsheet
-	)
-
 	var midiInChan = make(chan []byte, 10)
-	var midiOutChan = make(chan apcLEDS, 10)
+	var midiOutChan = make(chan apcLEDS, 40)
 	var messageChan = make(chan string)
 	var verseChan = make(chan verses)
 	var wg sync.WaitGroup
 
 	vcConf := vcConfig{
-		apiAddress:  apiAddress,
+		apiAddress:  *apiAddress,
 		messageChan: messageChan,
 		wg:          &wg,
 	}
 
 	vmixState := updateVmixState(vcConf)
-	vmConfig := newConfig(fileName, vmixState)
-	setInitialState(vmConfig, midiOutChan, vmixState)
+	vmConfig := newConfig(*fileName, vmixState)
+
+	setAllLed("off", midiOutChan)
+
 	vmClient, _ := vmixAPIConnect(vcConf)
 
-	go watchConfigFile(&vmConfig, fileName, vmixState)
+	go watchConfigFile(&vmConfig, *fileName, vmixState)
 
 	go getMessage(vmClient)
 	go processVmixMessage(vmClient, midiOutChan, vmixState, vmConfig)
@@ -1444,6 +1445,8 @@ func main() {
 	go initMidi(midiInChan, midiOutChan)
 	go processMidi(midiInChan, midiOutChan, verseChan, vmClient, vmConfig)
 	go versePager(verseChan, vmClient)
+
+	setInitialState(vmConfig, midiOutChan, vmixState)
 
 	defer vmClient.conn.Close()
 	defer close(vmClient.messageChan)
