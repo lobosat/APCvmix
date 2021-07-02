@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/360EntSecGroup-Skylar/excelize/v2"
 	"github.com/beevik/etree"
+	"github.com/mitchellh/go-ps"
 	"github.com/radovskyb/watcher"
 	"gitlab.com/gomidi/midi"
 	"gitlab.com/gomidi/midi/reader"
@@ -14,6 +15,8 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -1386,7 +1389,31 @@ func watchdog(midiPort *midiPorts, midiInChan chan []byte, midiOutChan chan apcL
 	}
 }
 
+// killOthers will kill other vmixAPC processes running.  This allows for setting up a browser input in vmix to
+// run the apcVmix program.  If vmixAPC starts acting up, just refresh the browser and a new instance will
+// come up.
+func killOthers() {
+	processes, _ := ps.Processes()
+	selfPID := os.Getpid()
+	fmt.Println("Self PID: ", selfPID)
+	for _, process := range processes {
+		var pid string
+		if process.Executable() == "vmixAPC.exe" && process.Pid() != selfPID {
+			pid = strconv.Itoa(process.Pid())
+			kill := exec.Command("TASKKILL", "/T", "/F", "/PID", pid)
+			err := kill.Run()
+			if err != nil {
+				fmt.Println("Error killing vmixAPC process", err)
+			}
+			fmt.Println("Killed ", process.Pid())
+		}
+	}
+}
+
 func main() {
+
+	killOthers()
+
 	const (
 		apiAddress = "127.0.0.1:8099"                                                                        // address and port for the vMix TCP API
 		fileName   = "D:/OneDrive/Episcopal Church of Reconciliation/Livestream - Documents/Livestream.xlsx" // path and filename to the configuration spreadsheet
