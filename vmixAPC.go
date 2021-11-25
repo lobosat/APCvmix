@@ -204,10 +204,10 @@ var oFader = map[int]int{
 	56: 9,
 }
 
-var DEBUG *bool
+var DEBUG bool
 
 func debug(msg ...interface{}) {
-	if *DEBUG {
+	if DEBUG == true {
 		fmt.Println(msg)
 	}
 }
@@ -835,12 +835,14 @@ func vmixAPIConnect(vc vcConfig) (*vmixClient, error) {
 // SendMessage sends a message to the vMix API. It adds the
 // /r/n terminator the API expects
 func SendMessage(client *vmixClient, message string) error {
-
+	client.lock.Lock()
 	pub := fmt.Sprintf("%v\r\n", message)
 	_, err := client.w.WriteString(pub)
-	if err == nil {
-		err = client.w.Flush()
+	if err != nil {
+		panic(err)
 	}
+	_ = client.w.Flush()
+	client.lock.Unlock()
 	debug("Sent message to API:", message)
 	return err
 }
@@ -1078,7 +1080,6 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 						if currentVerses.input != "" {
 							currentVerses.verseIndex++
 							if currentVerses.verseIndex < len(currentVerses.verses) {
-								debug("VersIndex: ", currentVerses.verseIndex, "  Verses Length: ", len(currentVerses.verses))
 								verseChan <- *currentVerses
 								midiOutChan <- apcLEDS{
 									buttons: []int{button},
@@ -1325,7 +1326,7 @@ func execTextOverlay(client *vmixClient, button int, conf config) {
 	if item, ok := conf.response[button]; ok {
 
 		//set the text
-		message = "FUNCTION SetText Input=" + item.input + "&SelectedName=" +
+		message = "FUNCTION SetText Input=" + url.QueryEscape(item.input) + "&SelectedName=" +
 			url.QueryEscape(item.tbName) +
 			"&Value=" + url.QueryEscape(item.response)
 		_ = SendMessage(client, message)
@@ -1349,9 +1350,12 @@ func versePager(verseChan chan verses, client *vmixClient) {
 		item := <-verseChan
 		debug("versePager received item:", item)
 
-		message = "FUNCTION SetText Input=" + item.input + "&SelectedName=TextBlock1.Text&Value=" +
+		message = "FUNCTION SetText Input=" + url.QueryEscape(item.input) + "&SelectedName=TextBlock1.Text&Value=" +
 			url.QueryEscape(item.verses[currentVerses.verseIndex])
-		_ = SendMessage(client, message)
+		err := SendMessage(client, message)
+		if err != nil {
+			fmt.Print("***Error sending message: ", err)
+		}
 		// Wait a bit to ensure title text is changed
 		time.Sleep(time.Millisecond * 300)
 		message = "FUNCTION OverlayInput1In Input=" + item.input
@@ -1537,7 +1541,7 @@ func killOthers() {
 func main() {
 
 	//Process any CLI args
-	DEBUG = flag.Bool("debug", false, "Display debugging info on stdout (true/false)")
+	DEBUG = *flag.Bool("debug", false, "Display debugging info on stdout (true/false)")
 	apiAddress := flag.String("apiAddr", "127.0.0.1:8099", "IP address and port of vMix API (127.0.0.1:8099)")
 	fileName := flag.String("fileName", "D:/OneDrive/Episcopal Church of Reconciliation/Livestream - Documents/Livestream.xlsx",
 		"Path and filename to the vmixAPC configuration workbook")
