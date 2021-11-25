@@ -8,12 +8,10 @@ import (
 	"github.com/360EntSecGroup-Skylar/excelize/v2"
 	"github.com/beevik/etree"
 	"github.com/mitchellh/go-ps"
-	"github.com/radovskyb/watcher"
 	"gitlab.com/gomidi/midi"
 	"gitlab.com/gomidi/midi/reader"
 	"gitlab.com/gomidi/midi/writer"
 	"gitlab.com/gomidi/rtmididrv"
-	"log"
 	"net"
 	"net/url"
 	"os"
@@ -61,6 +59,14 @@ type prayer struct {
 	verses []string
 }
 
+type pop struct {
+	button      int
+	input       string
+	tbName      string
+	verses      []string
+	initialized bool
+}
+
 type hymn struct {
 	button int
 	input  string
@@ -90,15 +96,24 @@ type activator struct {
 	offAction []string
 }
 
+type camera struct {
+	name     string
+	IP       string
+	user     string
+	password string
+}
+
 type fader struct {
 	fader int
 	input string
 }
 
 type config struct {
+	camera    map[string]*camera
 	fader     map[int]*fader
 	activator map[string]*map[string]activator
 	prayer    map[int]*prayer
+	pop       map[int]*pop
 	shortcut  map[int]*shortcut
 	response  map[int]*response
 	hymn      map[int]*hymn
@@ -381,17 +396,21 @@ func newConfig(filename string, vmixState state) config {
 	var scConfig = make(map[int]*shortcut)
 	var respConfig = make(map[int]*response)
 	var prayerConfig = make(map[int]*prayer)
+	var popConfig = make(map[int]*pop)
 	var hymnConfig = make(map[int]*hymn)
 	var speakerConfig = make(map[int]*speaker)
 	var activatorConfig = make(map[string]*map[string]activator)
 	var faderConfig = make(map[int]*fader)
 	var initialConfig = make(map[int]string)
 	var micsConfig = make(map[string]string)
+	var cameraConfig = make(map[string]*camera)
 
 	conf := config{
+		camera:    cameraConfig,
 		fader:     faderConfig,
 		activator: activatorConfig,
 		prayer:    prayerConfig,
+		pop:       popConfig,
 		hymn:      hymnConfig,
 		speaker:   speakerConfig,
 		shortcut:  scConfig,
@@ -404,6 +423,20 @@ func newConfig(filename string, vmixState state) config {
 	if err != nil {
 		fmt.Println("Error opening workbook:", err)
 		return conf
+	}
+
+	// NDI Cameras
+	ndiRows, _ := wb.GetRows("NDI Cameras")
+
+	for idx, row := range ndiRows {
+		if idx != 0 && len(row) > 1 {
+			ndiCam := new(camera)
+			ndiCam.name = strings.ToLower(row[0])
+			ndiCam.IP = row[1]
+			ndiCam.user = row[2]
+			ndiCam.password = row[3]
+			conf.camera[ndiCam.name] = ndiCam
+		}
 	}
 
 	//Initial configuration of LED colors on APC mini
@@ -477,6 +510,33 @@ func newConfig(filename string, vmixState state) config {
 		verses := col[3:]
 		pr.verses = verses
 		conf.prayer[btn] = pr
+	}
+
+	// Prayers of the People
+	// A separate section for prayers of the people as we need the overlay to be off
+	// between responses
+	popsCols, _ := wb.GetCols("PoP")
+	for _, col := range popsCols {
+		var response = new(pop)
+		var input string
+
+		// If input is provided as a number translate it to a name
+		if inputName, ok := vmixState.numberToName[col[1]]; ok {
+			input = inputName
+		} else {
+			input = col[1]
+		}
+
+		btn, _ := strconv.Atoi(col[2])
+		response.input = input
+		response.button = btn
+		response.tbName = vmixState.overlayTBNames[input]
+		response.initialized = false
+
+		//responses start at col[3].  Get a sub slice
+		verses := col[3:]
+		response.verses = verses
+		conf.pop[btn] = response
 	}
 
 	// Hymns
@@ -597,7 +657,7 @@ func newConfig(filename string, vmixState state) config {
 
 // watchConfigFile watches the configuration spreadsheet (responses.xlsx) for any changes (write).
 // If any changes are detected it will reload the conf variable with the new data.
-func watchConfigFile(conf *config, fileName string, vmixState state) {
+/* func watchConfigFile(conf *config, fileName string, vmixState state) {
 	w := watcher.New()
 
 	go func() {
@@ -623,7 +683,6 @@ func watchConfigFile(conf *config, fileName string, vmixState state) {
 	}
 
 }
-
 // updateConfig will update the current config variable by re-reading the configuration spreadsheet.  It is
 // intended to be called by a file watcher whenever the configuration sheet is changed.
 func updateConfig(conf *config, fileName string, vmixState state) {
@@ -737,7 +796,7 @@ func updateConfig(conf *config, fileName string, vmixState state) {
 	}
 
 }
-
+*/
 // vmixAPIConnect connects to the vMix API. apiAddress is a string
 // of the format ipaddress:port.  By default, the vMix API is on port 8099.
 // If vMix is not up, this function will continue trying to connect, and will
@@ -1008,6 +1067,37 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 					message = append(message, "FUNCTION AudioOn Input="+conf.mics["Crowd"])
 				}
 
+				if item, ok := conf.pop[button]; ok {
+
+					if conf.pop[button].initialized == false {
+						tbName := conf.pop[button].tbName
+						*currentVerses = verses{item.input, tbName, item.verses, 0}
+						verseChan <- *currentVerses
+						conf.pop[button].initialized = true
+					} else {
+						if currentVerses.input != "" {
+							currentVerses.verseIndex++
+							if currentVerses.verseIndex < len(currentVerses.verses) {
+								debug("VersIndex: ", currentVerses.verseIndex, "  Verses Length: ", len(currentVerses.verses))
+								verseChan <- *currentVerses
+								midiOutChan <- apcLEDS{
+									buttons: []int{button},
+									color:   "red",
+								}
+							} else {
+								//we got to the end. Turn off the button led
+								midiOutChan <- apcLEDS{
+									buttons: []int{button},
+									color:   "off",
+								}
+							}
+
+						}
+					}
+					//Turn on crowd mic
+					message = append(message, "FUNCTION AudioOn Input="+conf.mics["Crowd"])
+				}
+
 				if item, ok := conf.hymn[button]; ok {
 					tbName := conf.hymn[button].tbName
 					*currentVerses = verses{item.input, tbName, item.verses, 0}
@@ -1026,7 +1116,7 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 						m = "FUNCTION ScriptStart Value=" +
 							url.QueryEscape(script)
 						_ = SendMessage(client, m)
-						//Give the script some time complete
+						//Give the script some time to complete
 						time.Sleep(time.Millisecond * 500)
 					}
 
@@ -1057,6 +1147,40 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 								buttons: iLeds,
 								color:   color,
 							}
+							/*
+								} else if strings.HasPrefix(action, "preset") {
+									debug("Starting preset")
+									// Move PTZ camera to preset position
+									// syntax: preset camera_name preset_number
+									parts := strings.Split(action, " ")
+									camera := strings.ToLower(parts[1])
+									preset := parts[2]
+
+									if cameraConfig, ok := conf.camera[camera]; ok {
+										dev, err := onvif.NewDevice(cameraConfig.IP)
+										if err != nil {
+											debug("Unable to connect to NDI camera: ", cameraConfig.name, err)
+											panic("Unable to connect to camera")
+										}
+
+										dev.Authenticate(cameraConfig.user, cameraConfig.password)
+
+										if strings.ToLower(preset) == "home" {
+											_, err := dev.CallMethod(ptz.GotoHomePosition{})
+											if err != nil {
+												debug("NDI camera error moving to preset ", preset, err)
+											}
+										} else {
+											_, err := dev.CallMethod(ptz.GotoPreset{
+												PresetToken: onvif2.ReferenceToken(preset)})
+											if err != nil {
+												debug("NDI camera error moving to preset ", preset, err)
+											}
+										}
+
+										debug("Camera ", camera, "moved to preset", preset)
+									}
+							*/
 						} else if action == "Next" {
 							if currentVerses.input != "" {
 								currentVerses.verseIndex++
@@ -1080,10 +1204,9 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 							*currentVerses = verses{"", "", []string{}, 0}
 
 							message = append(message, m)
-							// Turn off crowd mic
-							message = append(message, "FUNCTION AudioOff Input="+conf.mics["Crowd"])
-							// Turn off choir mics
-							message = append(message, "FUNCTION BusXAudioOff Value=C")
+							// Run OverlayOff script
+							message = append(message, "FUNCTION ScriptStart Value=OverlayOff")
+
 						} else {
 							m := "FUNCTION " + action
 							message = append(message, m)
@@ -1096,8 +1219,10 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 				debug("Button Up:", msg[1], button)
 
 				//PoP remove response overlay
-				if button == 26 {
+				if _, ok := conf.pop[button]; ok {
 					message = append(message, "FUNCTION OverlayInput1Out")
+					//Turn off crowd mic
+					message = append(message, "FUNCTION AudioOff Input="+conf.mics["Crowd"])
 				}
 
 				//Check respConfig to see if we have a match. If so remove the overlay and turn
@@ -1220,13 +1345,14 @@ func execTextOverlay(client *vmixClient, button int, conf config) {
 func versePager(verseChan chan verses, client *vmixClient) {
 	var message string
 	for {
-		debug("starting versePager")
+
 		item := <-verseChan
 		debug("versePager received item:", item)
 
 		message = "FUNCTION SetText Input=" + item.input + "&SelectedName=TextBlock1.Text&Value=" +
 			url.QueryEscape(item.verses[currentVerses.verseIndex])
 		_ = SendMessage(client, message)
+		// Wait a bit to ensure title text is changed
 		time.Sleep(time.Millisecond * 300)
 		message = "FUNCTION OverlayInput1In Input=" + item.input
 		_ = SendMessage(client, message)
@@ -1296,11 +1422,12 @@ func getMIDIPorts() (err error, midiPort midiPorts) {
 	if foundAPCIn && foundAPCOut {
 		midiPort.in = &inPort
 		midiPort.out = &outPort
-
-		return nil, midiPort
+		err = nil
 	} else {
-		return errors.New("unable to find an APC Mini"), midiPorts{}
+		err = errors.New("unable to find an APC Mini")
 	}
+
+	return err, midiPort
 }
 
 func initMidi(midiInChan chan []byte, midiOutChan chan apcLEDS) {
@@ -1437,7 +1564,7 @@ func main() {
 
 	vmClient, _ := vmixAPIConnect(vcConf)
 
-	go watchConfigFile(&vmConfig, *fileName, vmixState)
+	//	go watchConfigFile(&vmConfig, *fileName, vmixState)
 
 	go getMessage(vmClient)
 	go processVmixMessage(vmClient, midiOutChan, vmixState, vmConfig)
