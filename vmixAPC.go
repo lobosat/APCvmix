@@ -8,11 +8,16 @@ import (
 	"github.com/360EntSecGroup-Skylar/excelize/v2"
 	"github.com/beevik/etree"
 	"github.com/mitchellh/go-ps"
+	"github.com/use-go/onvif"
+	"github.com/use-go/onvif/ptz"
+	onvif2 "github.com/use-go/onvif/xsd/onvif"
 	"gitlab.com/gomidi/midi"
 	"gitlab.com/gomidi/midi/reader"
 	"gitlab.com/gomidi/midi/writer"
 	"gitlab.com/gomidi/rtmididrv"
+	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -101,6 +106,7 @@ type camera struct {
 	IP       string
 	user     string
 	password string
+	mode     string
 }
 
 type fader struct {
@@ -435,6 +441,7 @@ func newConfig(filename string, vmixState state) config {
 			ndiCam.IP = row[1]
 			ndiCam.user = row[2]
 			ndiCam.password = row[3]
+			ndiCam.mode = row[4]
 			conf.camera[ndiCam.name] = ndiCam
 		}
 	}
@@ -1066,7 +1073,8 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 					*currentVerses = verses{item.input, tbName, item.verses, 0}
 					verseChan <- *currentVerses
 					//Turn on crowd mic
-					message = append(message, "FUNCTION AudioOn Input="+conf.mics["Crowd"])
+					//message = append(message, "FUNCTION AudioOn Input="+conf.mics["Crowd"])
+					message = append(message, "FUNCTION AudioBusOn Value=M&Input="+conf.mics["Crowd"])
 				}
 
 				if item, ok := conf.pop[button]; ok {
@@ -1096,7 +1104,7 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 						}
 					}
 					//Turn on crowd mic
-					message = append(message, "FUNCTION AudioOn Input="+conf.mics["Crowd"])
+					message = append(message, "FUNCTION AudioBusOn Value=M&Input="+conf.mics["Crowd"])
 				}
 
 				if item, ok := conf.hymn[button]; ok {
@@ -1148,40 +1156,19 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 								buttons: iLeds,
 								color:   color,
 							}
-							/*
-								} else if strings.HasPrefix(action, "preset") {
-									debug("Starting preset")
-									// Move PTZ camera to preset position
-									// syntax: preset camera_name preset_number
-									parts := strings.Split(action, " ")
-									camera := strings.ToLower(parts[1])
-									preset := parts[2]
 
-									if cameraConfig, ok := conf.camera[camera]; ok {
-										dev, err := onvif.NewDevice(cameraConfig.IP)
-										if err != nil {
-											debug("Unable to connect to NDI camera: ", cameraConfig.name, err)
-											panic("Unable to connect to camera")
-										}
+						} else if strings.HasPrefix(action, "preset") {
+							debug("Starting move to preset")
+							// Move PTZ camera to preset position
+							// syntax: preset camera_name preset_number
+							parts := strings.Split(action, " ")
+							camera := strings.ToLower(parts[1])
+							preset := parts[2]
 
-										dev.Authenticate(cameraConfig.user, cameraConfig.password)
+							if cameraConfig, ok := conf.camera[camera]; ok {
+								cameraPreset(cameraConfig, preset)
+							}
 
-										if strings.ToLower(preset) == "home" {
-											_, err := dev.CallMethod(ptz.GotoHomePosition{})
-											if err != nil {
-												debug("NDI camera error moving to preset ", preset, err)
-											}
-										} else {
-											_, err := dev.CallMethod(ptz.GotoPreset{
-												PresetToken: onvif2.ReferenceToken(preset)})
-											if err != nil {
-												debug("NDI camera error moving to preset ", preset, err)
-											}
-										}
-
-										debug("Camera ", camera, "moved to preset", preset)
-									}
-							*/
 						} else if action == "Next" {
 							if currentVerses.input != "" {
 								currentVerses.verseIndex++
@@ -1223,7 +1210,8 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 				if _, ok := conf.pop[button]; ok {
 					message = append(message, "FUNCTION OverlayInput1Out")
 					//Turn off crowd mic
-					message = append(message, "FUNCTION AudioOff Input="+conf.mics["Crowd"])
+					//message = append(message, "FUNCTION AudioOff Input="+conf.mics["Crowd"])
+					message = append(message, "FUNCTION AudioBusOff Value=M&Input="+conf.mics["Crowd"])
 				}
 
 				//Check respConfig to see if we have a match. If so remove the overlay and turn
@@ -1231,7 +1219,8 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 
 				if _, ok := conf.response[button]; ok {
 					message = append(message, "FUNCTION OverlayInput1Out")
-					message = append(message, "FUNCTION AudioOff Input="+conf.mics["Crowd"])
+					//message = append(message, "FUNCTION AudioOff Input="+conf.mics["Crowd"])
+					message = append(message, "FUNCTION AudioBusOff Value=M&Input="+conf.mics["Crowd"])
 
 					if button == 14 || button == 15 || button == 16 {
 						midiOutChan <- apcLEDS{
@@ -1320,6 +1309,70 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 	}
 }
 
+func cameraPreset(cameraConfig *camera, preset string) {
+	if strings.ToLower(cameraConfig.mode) == "onvif" {
+		dev, err := onvif.NewDevice(cameraConfig.IP)
+		if err != nil {
+			debug("Unable to connect to NDI camera: ", cameraConfig.name, err)
+			panic("Unable to connect to camera")
+		}
+
+		dev.Authenticate(cameraConfig.user, cameraConfig.password)
+
+		if strings.ToLower(preset) == "home" {
+			_, err := dev.CallMethod(ptz.GotoHomePosition{})
+			if err != nil {
+				debug("NDI camera error moving to preset ", preset, err)
+			}
+		} else {
+			_, err := dev.CallMethod(ptz.GotoPreset{
+				PresetToken: onvif2.ReferenceToken(preset)})
+			if err != nil {
+				debug("NDI camera error moving to preset ", preset, err)
+			}
+		}
+
+		debug("Camera ", cameraConfig.name, "moved to preset", preset)
+	}
+
+	if strings.ToLower(cameraConfig.mode) == "cgi" {
+		camURL := "http://" + cameraConfig.IP + "/cgi-bin/ptzctrl.cgi?ptzcmd&poscall&" + preset
+		fmt.Println(camURL)
+		//camURL := "http://10.0.20.10/cgi-bin/ptzctrl.cgi?ptzcmd&poscall&1"
+		resp, err := http.Get(camURL)
+		if err != nil {
+			print(err)
+		}
+
+		if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+			fmt.Println("HTTP Status is in the 2xx range")
+		} else {
+			fmt.Println("Argh! Broken")
+		}
+	}
+
+	if strings.ToLower(cameraConfig.mode) == "visca" {
+		iPreset, _ := strconv.Atoi(preset)
+		bPreset := byte(iPreset)
+		s := []byte{0x81, 0x01, 0x04, 0x3F, 0x02, bPreset, 0xFF}
+
+		viscaCon, _ := net.Dial("udp", cameraConfig.IP)
+
+		defer func(viscaCon net.Conn) {
+			err := viscaCon.Close()
+			if err != nil {
+				log.Fatalln(err)
+			}
+		}(viscaCon)
+
+		_, err := viscaCon.Write(s)
+		if err != nil {
+			log.Fatalln(err)
+		}
+	}
+
+}
+
 func execTextOverlay(client *vmixClient, button int, conf config) {
 	var message string
 
@@ -1332,7 +1385,8 @@ func execTextOverlay(client *vmixClient, button int, conf config) {
 		_ = SendMessage(client, message)
 
 		// Turn on the crowd mic
-		message = "FUNCTION AudioOn Input=" + conf.mics["Crowd"]
+		//message = "FUNCTION AudioOn Input=" + conf.mics["Crowd"]
+		message = "FUNCTION AudioBusOn Value=M&Input=" + conf.mics["Crowd"]
 		_ = SendMessage(client, message)
 
 		//pause for 100 milliseconds to allow text to update in the title
