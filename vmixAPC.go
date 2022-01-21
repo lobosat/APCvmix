@@ -15,7 +15,6 @@ import (
 	"gitlab.com/gomidi/midi/reader"
 	"gitlab.com/gomidi/midi/writer"
 	"gitlab.com/gomidi/rtmididrv"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -210,10 +209,10 @@ var oFader = map[int]int{
 	56: 9,
 }
 
-var DEBUG bool
+var DEBUG *bool
 
 func debug(msg ...interface{}) {
-	if DEBUG == true {
+	if *DEBUG == true {
 		fmt.Println(msg)
 	}
 }
@@ -1158,12 +1157,13 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 							}
 
 						} else if strings.HasPrefix(action, "preset") {
-							debug("Starting move to preset")
+
 							// Move PTZ camera to preset position
 							// syntax: preset camera_name preset_number
 							parts := strings.Split(action, " ")
 							camera := strings.ToLower(parts[1])
 							preset := parts[2]
+							debug("Starting move camera '" + camera + "' to preset: " + preset)
 
 							if cameraConfig, ok := conf.camera[camera]; ok {
 								cameraPreset(cameraConfig, preset)
@@ -1310,11 +1310,15 @@ func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan cha
 }
 
 func cameraPreset(cameraConfig *camera, preset string) {
+
+	if strings.ToLower(cameraConfig.mode) == "null" {
+		debug("Null camera: not doing anything")
+		return
+	}
 	if strings.ToLower(cameraConfig.mode) == "onvif" {
 		dev, err := onvif.NewDevice(cameraConfig.IP)
 		if err != nil {
 			debug("Unable to connect to NDI camera: ", cameraConfig.name, err)
-			panic("Unable to connect to camera")
 		}
 
 		dev.Authenticate(cameraConfig.user, cameraConfig.password)
@@ -1336,6 +1340,7 @@ func cameraPreset(cameraConfig *camera, preset string) {
 	}
 
 	if strings.ToLower(cameraConfig.mode) == "cgi" {
+		// for bzbgear ptz cameras
 		camURL := "http://" + cameraConfig.IP + "/cgi-bin/ptzctrl.cgi?ptzcmd&poscall&" + preset
 		fmt.Println(camURL)
 		//camURL := "http://10.0.20.10/cgi-bin/ptzctrl.cgi?ptzcmd&poscall&1"
@@ -1361,13 +1366,13 @@ func cameraPreset(cameraConfig *camera, preset string) {
 		defer func(viscaCon net.Conn) {
 			err := viscaCon.Close()
 			if err != nil {
-				log.Fatalln(err)
+				debug("Unable to connect via visca to camera '" + cameraConfig.name + "' at " + cameraConfig.IP)
 			}
 		}(viscaCon)
 
 		_, err := viscaCon.Write(s)
 		if err != nil {
-			log.Fatalln(err)
+			debug("Unable to write via visca to camera '" + cameraConfig.name + "' at " + cameraConfig.IP)
 		}
 	}
 
@@ -1595,11 +1600,12 @@ func killOthers() {
 func main() {
 
 	//Process any CLI args
-	DEBUG = *flag.Bool("debug", false, "Display debugging info on stdout (true/false)")
+	DEBUG = flag.Bool("debug", false, "Display debugging info on stdout (true/false)")
 	apiAddress := flag.String("apiAddr", "127.0.0.1:8099", "IP address and port of vMix API (127.0.0.1:8099)")
-	fileName := flag.String("fileName", "D:/OneDrive/Episcopal Church of Reconciliation/Livestream - Documents/Livestream.xlsx",
+	fileName := flag.String("fileName", "D:/OneDrive/Episcopal Church of Reconciliation/Livestream - Documents/Livestream.xlsm",
 		"Path and filename to the vmixAPC configuration workbook")
 	flag.Parse()
+	debug("Starting vMixAPC ...")
 
 	killOthers()
 
