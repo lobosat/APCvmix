@@ -1041,6 +1041,76 @@ func processActivator(vmixMessage string, midiOutChan chan apcLEDS, conf config)
 	}
 }
 
+// sendMidi is used to mimic an APC Mini.  It listens on port 2000 for button press commands.
+// commands are: p [button number] -> press button
+//               r [button number] -> release button
+func sendMidi(midiInChan chan []byte) {
+
+	//r := bufio.NewReader(os.Stdin)
+	fmt.Println("Virtual MIDI Input")
+	fmt.Println("---------------------")
+
+	l, err := net.Listen("tcp", "localhost:2000")
+	if err != nil {
+		fmt.Println("Error listening:", err.Error())
+		os.Exit(1)
+	}
+
+	defer func(l net.Listener) {
+		err := l.Close()
+		if err != nil {
+
+		}
+	}(l)
+
+	c, err := l.Accept()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	for {
+		//fmt.Print("-> ")
+		//textCommand, _ := r.ReadString('\n')
+
+		netData, err := bufio.NewReader(c).ReadString('\n')
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		if strings.TrimSpace(netData) == "STOP" {
+			fmt.Println("Exiting TCP server!")
+			return
+		}
+
+		// remove CRLF (\r\n) -- This works for Windows - need to modify for Linux
+		cleanCommand := strings.TrimSpace(netData)
+		sliceCommand := strings.Split(cleanCommand, " ")
+		// Convert button number to integer
+		intButton, _ := strconv.Atoi(sliceCommand[1])
+		// Convert from my numbering of buttons to the APC numbering of buttons
+		apcButton := oButton[intButton]
+		// Convert button to byte
+		byteButton := byte(apcButton)
+
+		// message is a byte [type button velocity]
+		// type 144, velocity 0 is a button up
+		// type 144, velocity 127 is a button down
+		// type 176 is a control change
+
+		if sliceCommand[0] == "p" {
+			message := []byte{144, byteButton, 127}
+			midiInChan <- message
+		}
+
+		if sliceCommand[0] == "r" {
+			message := []byte{144, byteButton, 0}
+			midiInChan <- message
+		}
+
+	}
+}
+
 func processMidi(midiInChan chan []byte, midiOutChan chan apcLEDS, verseChan chan verses, client *vmixClient,
 	conf config) {
 	// message is a byte [type button velocity]
@@ -1638,6 +1708,8 @@ func main() {
 	go versePager(verseChan, vmClient)
 
 	setInitialState(vmConfig, midiOutChan, vmixState)
+
+	go sendMidi(midiInChan)
 
 	defer vmClient.conn.Close()
 	defer close(vmClient.messageChan)
